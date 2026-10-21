@@ -27,6 +27,7 @@ class RemoteControlApp:
         self._build_ui()
         self.refresh_devices()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.refresh_dashboard_loop()
 
     def _build_ui(self):
         style = ttk.Style()
@@ -60,12 +61,63 @@ class RemoteControlApp:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=12, pady=8)
 
+        dashboard_tab = ttk.Frame(notebook, padding=16)
         mirror_tab = ttk.Frame(notebook, padding=12)
         apps_tab = ttk.Frame(notebook, padding=12)
         files_tab = ttk.Frame(notebook, padding=12)
         usage_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(dashboard_tab, text="Dashboard")
         notebook.add(mirror_tab, text="Mirroring & Kontrol")
         notebook.add(apps_tab, text="Aplikasi")
+
+        ttk.Label(
+            dashboard_tab, text="Ringkasan Perangkat",
+            font=("TkDefaultFont", 16, "bold")
+        ).pack(anchor="w", pady=(0, 12))
+
+        self.dashboard_connection = tk.StringVar(value="Memeriksa koneksi...")
+        self.dashboard_model = tk.StringVar(value="-")
+        self.dashboard_android = tk.StringVar(value="-")
+        self.dashboard_battery = tk.StringVar(value="-")
+        self.dashboard_storage = tk.StringVar(value="-")
+
+        info_frame = ttk.LabelFrame(
+            dashboard_tab, text="Informasi HP", padding=12
+        )
+        info_frame.pack(fill="x", pady=4)
+
+        for label, variable in [
+            ("Status koneksi", self.dashboard_connection),
+            ("Model perangkat", self.dashboard_model),
+            ("Versi Android", self.dashboard_android),
+            ("Baterai", self.dashboard_battery),
+            ("Penyimpanan /data", self.dashboard_storage),
+        ]:
+            line = ttk.Frame(info_frame)
+            line.pack(fill="x", pady=5)
+            ttk.Label(line, text=label, width=22).pack(side="left")
+            ttk.Label(
+                line, textvariable=variable,
+                font=("TkDefaultFont", 10, "bold")
+            ).pack(side="left", fill="x", expand=True)
+
+        dashboard_buttons = ttk.Frame(dashboard_tab)
+        dashboard_buttons.pack(fill="x", pady=12)
+        ttk.Button(
+            dashboard_buttons, text="Perbarui informasi",
+            command=self.refresh_dashboard
+        ).pack(side="left")
+        ttk.Button(
+            dashboard_buttons, text="Refresh perangkat",
+            command=self.refresh_devices
+        ).pack(side="left", padx=8)
+
+        ttk.Label(
+            dashboard_tab,
+            text="Informasi diperoleh melalui ADB. Dashboard ini memantau "
+                 "perangkat, bukan mengunci HP secara permanen.",
+            wraplength=850
+        ).pack(anchor="w", pady=8)
         notebook.add(files_tab, text="Transfer File")
         notebook.add(usage_tab, text="Screen Time")
 
@@ -169,6 +221,66 @@ class RemoteControlApp:
                 self.status.set("Belum ada HP terotorisasi. Periksa kabel USB dan USB Debugging.")
         except Exception as exc:
             self.show_error("Gagal mendeteksi perangkat", exc)
+
+    def refresh_dashboard(self):
+        if not self.device.get().strip():
+            self.dashboard_connection.set("Tidak terhubung")
+            self.dashboard_model.set("-")
+            self.dashboard_android.set("-")
+            self.dashboard_battery.set("-")
+            self.dashboard_storage.set("-")
+            return
+
+        try:
+            model = self.run_adb(
+                ["shell", "getprop", "ro.product.model"], timeout=8
+            )
+            android = self.run_adb(
+                ["shell", "getprop", "ro.build.version.release"], timeout=8
+            )
+            battery_output = self.run_adb(
+                ["shell", "dumpsys", "battery"], timeout=8
+            )
+            battery_level = next(
+                (
+                    line.split(":", 1)[1].strip()
+                    for line in battery_output.splitlines()
+                    if line.strip().startswith("level:")
+                ),
+                None,
+            )
+
+            storage_output = self.run_adb(
+                ["shell", "df", "-h", "/data"], timeout=8
+            )
+            storage_lines = storage_output.splitlines()
+            storage = "Tidak tersedia"
+            if len(storage_lines) >= 2:
+                columns = storage_lines[-1].split()
+                if len(columns) >= 5:
+                    storage = (
+                        f"Terpakai {columns[2]} dari {columns[1]} "
+                        f"({columns[4]})"
+                    )
+
+            self.dashboard_connection.set("Terhubung melalui ADB")
+            self.dashboard_model.set(model or "Tidak diketahui")
+            self.dashboard_android.set(android or "Tidak diketahui")
+            self.dashboard_battery.set(
+                f"{battery_level}%" if battery_level else "Tidak tersedia"
+            )
+            self.dashboard_storage.set(storage)
+        except Exception as exc:
+            self.dashboard_connection.set("Gagal membaca perangkat")
+            self.dashboard_model.set("-")
+            self.dashboard_android.set("-")
+            self.dashboard_battery.set("-")
+            self.dashboard_storage.set("-")
+            self.status.set(str(exc))
+
+    def refresh_dashboard_loop(self):
+        self.refresh_dashboard()
+        self.root.after(10000, self.refresh_dashboard_loop)
 
     def device_info(self):
         try:
