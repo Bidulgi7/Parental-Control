@@ -30,19 +30,121 @@ class RemoteControlApp:
         self.refresh_dashboard_loop()
 
     def _build_ui(self):
+        # Tema visual modern untuk desktop Linux.
+        self.root.configure(bg="#F3F6FC")
+
         style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
+        style.theme_use("clam")
+
+        BG = "#F3F6FC"
+        CARD = "#FFFFFF"
+        NAVY = "#17243A"
+        BLUE = "#356DF3"
+        TEXT = "#243149"
+        MUTED = "#68758B"
+        BORDER = "#DCE4F0"
+
+        style.configure(".", font=("DejaVu Sans", 10))
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure(
+            "Header.TLabel",
+            background=BG,
+            foreground=NAVY,
+            font=("DejaVu Sans", 21, "bold")
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background=BG,
+            foreground=MUTED,
+            font=("DejaVu Sans", 9)
+        )
+        style.configure(
+            "TLabelframe",
+            background=CARD,
+            bordercolor=BORDER,
+            relief="solid",
+            borderwidth=1
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=CARD,
+            foreground=NAVY,
+            font=("DejaVu Sans", 10, "bold")
+        )
+        style.configure(
+            "TButton",
+            background=CARD,
+            foreground=TEXT,
+            bordercolor=BORDER,
+            padding=(13, 8),
+            relief="flat",
+            font=("DejaVu Sans", 9, "bold")
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#E8EEFF"), ("pressed", "#D8E3FF")],
+            foreground=[("disabled", "#9AA5B5")]
+        )
+        style.configure(
+            "Accent.TButton",
+            background=BLUE,
+            foreground="#FFFFFF",
+            bordercolor=BLUE,
+            padding=(14, 9)
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#2559D9"), ("pressed", "#1E49B7")],
+            foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")]
+        )
+        style.configure(
+            "TNotebook",
+            background=BG,
+            borderwidth=0,
+            tabmargins=(2, 5, 2, 0)
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background="#E8EDF6",
+            foreground=MUTED,
+            padding=(15, 10),
+            font=("DejaVu Sans", 9, "bold")
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", CARD), ("active", "#DCE6FA")],
+            foreground=[("selected", BLUE), ("active", NAVY)]
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=CARD,
+            foreground=TEXT,
+            bordercolor=BORDER,
+            padding=7
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=CARD,
+            background=CARD,
+            foreground=TEXT,
+            padding=6
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background="#D9E2F0",
+            troughcolor=BG,
+            bordercolor=BG,
+            arrowsize=13
+        )
 
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, font=("TkDefaultFont", 18, "bold")).pack(anchor="w")
+        ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
             text="USB + ADB • Gunakan hanya pada perangkat milikmu atau yang kamu punya izin untuk kelola.",
-            wraplength=940
+            wraplength=940, style="Subtitle.TLabel"
         ).pack(anchor="w", pady=(4, 8))
 
         device_frame = ttk.LabelFrame(self.root, text="Perangkat Android", padding=10)
@@ -148,7 +250,21 @@ class RemoteControlApp:
         ).pack(anchor="w", pady=6)
         list_frame = ttk.Frame(apps_tab)
         list_frame.pack(fill="both", expand=True, pady=4)
-        self.package_list = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=18)
+        self.package_list = tk.Listbox(
+            list_frame,
+            selectmode=tk.EXTENDED,
+            height=18,
+            bg="#FFFFFF",
+            fg="#243149",
+            selectbackground="#356DF3",
+            selectforeground="#FFFFFF",
+            highlightbackground="#DCE4F0",
+            highlightcolor="#356DF3",
+            relief="flat",
+            borderwidth=1,
+            font=("DejaVu Sans Mono", 10),
+            activestyle="none"
+        )
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.package_list.yview)
         self.package_list.configure(yscrollcommand=scrollbar.set)
         self.package_list.pack(side="left", fill="both", expand=True)
