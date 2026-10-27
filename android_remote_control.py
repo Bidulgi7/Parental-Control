@@ -460,6 +460,14 @@ class RemoteControlApp:
         ttk.Button(proc_top, text="Muat Proses (PS)", command=self.load_processes).pack(side="left")
         ttk.Button(proc_top, text="Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
 
+        self.auto_refresh_var = tk.BooleanVar(value=False)
+        self.auto_refresh_btn = ttk.Checkbutton(
+            proc_top, text="Auto-Refresh (Real-Time)", 
+            variable=self.auto_refresh_var, 
+            command=self.toggle_auto_refresh
+        )
+        self.auto_refresh_btn.pack(side="left", padx=12)
+
         tree_frame = ttk.Frame(process_tab)
         tree_frame.pack(fill="both", expand=True, pady=4)
 
@@ -476,11 +484,11 @@ class RemoteControlApp:
         self.proc_tree.heading("CPU (%)", text="CPU (%)")
         self.proc_tree.heading("Command / Nama Proses", text="Command / Nama Proses")
 
-        self.proc_tree.column("PID", width=80, anchor="center", stretch=False)
-        self.proc_tree.column("USER", width=100, anchor="center", stretch=False)
-        self.proc_tree.column("STATUS", width=80, anchor="center", stretch=False)
-        self.proc_tree.column("NICE", width=80, anchor="center", stretch=False)
-        self.proc_tree.column("CPU (%)", width=80, anchor="center", stretch=False)
+        self.proc_tree.column("PID", width=200, anchor="center", stretch=False)
+        self.proc_tree.column("USER", width=200, anchor="center", stretch=False)
+        self.proc_tree.column("STATUS", width=200, anchor="center", stretch=False)
+        self.proc_tree.column("NICE", width=200, anchor="center", stretch=False)
+        self.proc_tree.column("CPU (%)", width=200, anchor="center", stretch=False)
         self.proc_tree.column("Command / Nama Proses", width=500, anchor="w", stretch=True)
 
         proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
@@ -536,6 +544,33 @@ class RemoteControlApp:
         footer.pack(fill="x")
         ttk.Separator(footer).pack(fill="x", pady=(0, 8))
         ttk.Label(footer, text="Status: ADB hanya berfungsi setelah otorisasi USB Debugging disetujui pada HP.").pack(anchor="w")
+
+    def toggle_auto_refresh(self):
+        """Mengaktifkan atau menonaktifkan pembaruan proses secara real-time."""
+        if self.auto_refresh_var.get():
+            self.status.set("Auto-refresh proses real-time diaktifkan (setiap 3 detik).")
+            self._realtime_process_loop()
+        else:
+            self.status.set("Auto-refresh proses dinonaktifkan.")
+
+    def _realtime_process_loop(self):
+        """Looping otomatis untuk memperbarui tabel proses secara berkala."""
+        # Periksa apakah checkbox masih dicentang dan tab aktif
+        if getattr(self, 'auto_refresh_var', None) and self.auto_refresh_var.get():
+            try:
+                # Muat ulang proses secara senyap di latar belakang
+                device_id = self.device.get().strip()
+                if device_id:
+                    processes = self.os_handler.get_process_table(device_id)
+                    for item in self.proc_tree.get_children():
+                        self.proc_tree.delete(item)
+                    for proc in processes:
+                        self.proc_tree.insert("", "end", values=proc)
+            except Exception:
+                pass  # Abaikan jeda sesaat saat kabel/adb sibuk
+
+            # Jadwalkan eksekusi berikutnya setelah 3 detik (3000 ms)
+            self.root.after(3000, self._realtime_process_loop)
 
     def on_close(self):
         self.stop_timer()

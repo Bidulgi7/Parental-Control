@@ -70,7 +70,7 @@ class OSFeaturesHandler:
         return descriptions.get(key, "Parameter manajemen memori kernel Linux.")
 
     def get_process_table(self, device_id):
-        """Mengambil daftar proses dan persentase penggunaan CPU per proses."""
+        """Mengambil daftar proses dengan memastikan nama aplikasi/command terbaca utuh."""
         try:
             output = self.run_adb_func(device_id, args=["shell", "top", "-n", "1", "-b"], timeout=15)
             processes = []
@@ -78,28 +78,24 @@ class OSFeaturesHandler:
             data_started = False
 
             for line in lines:
+                # Deteksi baris header dari perintah top Android
                 if "PID" in line and ("CPU" in line or "COMMAND" in line or "NAME" in line):
                     data_started = True
                     continue
 
                 if data_started and line.strip():
-                    parts = line.split(None, 9)
+                    # Pisahkan maksimal 8 bagian pertama, biarkan sisa baris menjadi satu nama aplikasi utuh
+                    parts = line.split(None, 8)
                     if len(parts) >= 9:
                         pid = parts[0]
-                        user = "system"
+                        user = parts[1]
+                        cpu_pct = parts[2] + "%"
                         status = parts[3]
                         nice = "0"
-                        cpu_pct = parts[2] + "%"
-                        name = parts[8] if len(parts) > 8 else "Unknown"
+                        # Mengambil kolom terakhir (indeks ke-8) yang berisi nama proses/aplikasi secara lengkap
+                        name = parts[8].strip()
+
                         processes.append((pid, user, status, nice, cpu_pct, name))
             return processes
-        except Exception:
-            # Fallback ke ps jika top gagal
-            output = self.run_adb_func(device_id, args=["shell", "ps", "-eo", "PID,USER,S,NI,NAME"], timeout=10)
-            processes = []
-            for line in output.splitlines()[1:]:
-                parts = line.split(None, 4)
-                if len(parts) >= 5:
-                    pid, user, status, nice, name = parts
-                    processes.append((pid, user, status, nice, "N/A", name))
-            return processes
+        except Exception as exc:
+            raise RuntimeError(f"Gagal mengambil tabel proses: {str(exc)}")
