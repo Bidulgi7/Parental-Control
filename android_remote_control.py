@@ -220,6 +220,43 @@ class RemoteControlApp:
                  "perangkat, bukan mengunci HP secara permanen.",
             wraplength=850
         ).pack(anchor="w", pady=8)
+process_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(process_tab, text="Manajemen Proses & CPU")
+
+        ttk.Label(process_tab, text="Daftar Proses Android & Penjadwalan (Process Table)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        ttk.Label(process_tab, text="Menampilkan informasi PID, Status, dan Prioritas (Nice Value) proses yang berjalan di kernel Android.").pack(anchor="w", pady=4)
+
+        proc_top = ttk.Frame(process_tab)
+        proc_top.pack(fill="x", pady=6)
+        ttk.Button(proc_top, text="Muat Proses (PS)", command=self.load_processes).pack(side="left")
+        ttk.Button(proc_top, text="Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
+
+        tree_frame = ttk.Frame(process_tab)
+        tree_frame.pack(fill="both", expand=True, pady=4)
+
+        self.proc_tree = ttk.Treeview(
+            tree_frame, 
+            columns=("PID", "USER", "STATUS", "NICE", "COMMAND"), 
+            show="headings", 
+            height=15
+        )
+        self.proc_tree.heading("PID", text="PID")
+        self.proc_tree.heading("USER", text="User")
+        self.proc_tree.heading("STATUS", text="Status")
+        self.proc_tree.heading("NICE", text="Nice (NI)")
+        self.proc_tree.heading("COMMAND", text="Command / Nama Proses")
+
+        self.proc_tree.column("PID", width=70, anchor="center")
+        self.proc_tree.column("USER", width=100, anchor="w")
+        self.proc_tree.column("STATUS", width=70, anchor="center")
+        self.proc_tree.column("NICE", width=70, anchor="center")
+        self.proc_tree.column("COMMAND", width=350, anchor="w")
+
+        proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
+        self.proc_tree.configure(yscrollcommand=proc_scroll.set)
+        
+        self.proc_tree.pack(side="left", fill="both", expand=True)
+        proc_scroll.pack(side="right", fill="y")
         notebook.add(files_tab, text="Transfer File")
         notebook.add(usage_tab, text="Screen Time")
 
@@ -554,6 +591,44 @@ class RemoteControlApp:
                 self.lock_screen()
             return
         self.timer_job = self.root.after(1000, self._tick_timer)
+def load_processes(self):
+        """Mengambil daftar proses aktif dari Android via ADB (mirip perintah ps di OS Linux)."""
+        try:
+            output = self.run_adb(["shell", "ps", "-eo", "USER,PID,S,NI,NAME"], timeout=20)
+            
+            for item in self.proc_tree.get_children():
+                self.proc_tree.delete(item)
+
+            lines = output.splitlines()
+            for line in lines[1:]:
+                parts = line.split(None, 4)
+                if len(parts) >= 5:
+                    user, pid, status, nice, name = parts
+                    self.proc_tree.insert("", "end", values=(pid, user, status, nice, name))
+
+            self.status.set(f"Berhasil memuat tabel proses sistem Android.")
+        except Exception as exc:
+            self.show_error("Gagal memuat proses", exc)
+
+    def change_process_priority(self):
+        """Mengubah nilai nice suatu proses untuk simulasi penjadwalan CPU."""
+        selected_item = self.proc_tree.selection()
+        if not selected_item:
+            messagebox.showinfo("Pilih Proses", "Pilih salah satu baris proses dari tabel terlebih dahulu.", parent=self.root)
+            return
+        
+        item_data = self.proc_tree.item(selected_item[0])['values']
+        pid = item_data[0]
+        name = item_data[4]
+
+        new_nice = tk.simpledialog.askinteger("Ubah Prioritas (Nice)", f"PID {pid} ({name}):\nMasukkan nilai Nice (-20 sampai 19):", minvalue=-20, maxvalue=19, parent=self.root)
+        if new_nice is not None:
+            try:
+                self.run_adb(["shell", "renice", str(new_nice), str(pid)], timeout=10)
+                self.status.set(f"Prioritas PID {pid} berhasil diubah menjadi {new_nice}.")
+                self.load_processes()
+            except Exception as exc:
+                self.show_error("Gagal mengubah prioritas", exc)
 
     def on_close(self):
         self.stop_timer()
