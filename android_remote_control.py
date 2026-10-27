@@ -90,6 +90,56 @@ class RemoteControlApp:
             self.sync_log.insert(tk.END, f"[SYNC/MUTEX] {message}\n")
             self.sync_log.see(tk.END)
 
+    def load_memory_info(self):
+        """Mengambil informasi manajemen memori dan swapping dari kernel Android (/proc/meminfo)."""
+        try:
+            # Eksekusi perintah adb shell untuk membaca meminfo
+            output = self.run_adb(["shell", "cat", "/proc/meminfo"], timeout=10)
+
+            # Bersihkan isi tabel atau widget sebelumnya
+            for item in self.mem_tree.get_children():
+                self.mem_tree.delete(item)
+
+            # Parsing baris per baris dari /proc/meminfo
+            memory_data = {}
+            for line in output.splitlines():
+                parts = line.split(":")
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip()
+                    memory_data[key] = val
+
+            # Filter parameter penting untuk Teori OS (RAM & Swapping)
+            target_keys = [
+                "MemTotal", "MemFree", "MemAvailable", "Buffers", 
+                "Cached", "SwapTotal", "SwapFree", "VmallocTotal", "VmallocUsed"
+            ]
+
+            for key in target_keys:
+                if key in memory_data:
+                    # Berikan keterangan deskriptif ala OS
+                    desc = self._get_memory_description(key)
+                    self.mem_tree.insert("", "end", values=(key, memory_data[key], desc))
+
+            self.status.set("Berhasil memuat data manajemen memori dan swapping Android.")
+        except Exception as exc:
+            self.show_error("Gagal memuat info memori", exc)
+
+    def _get_memory_description(self, key):
+        """Memberikan penjelasan teoretis OS untuk setiap parameter memori."""
+        descriptions = {
+            "MemTotal": "Total kapasitas RAM fisik yang dapat diakses oleh sistem operasi.",
+            "MemFree": "Kapasitas RAM murni yang belum digunakan sama sekali.",
+            "MemAvailable": "Estimasi RAM yang tersedia untuk menjalankan aplikasi baru tanpa swapping.",
+            "Buffers": "Memori RAM yang dialokasikan untuk buffer blok disk I/O.",
+            "Cached": "Memori RAM yang digunakan untuk cache file sistem/kernel.",
+            "SwapTotal": "Total kapasitas ruang swap (memori virtual cadangan di storage).",
+            "SwapFree": "Kapasitas ruang swap yang saat ini masih kosong/belum terpakai.",
+            "VmallocTotal": "Total ruang memori virtual yang dialokasikan kernel.",
+            "VmallocUsed": "Ruang memori virtual kernel yang sedang terpakai."
+        }
+        return descriptions.get(key, "Parameter manajemen memori kernel Linux.")
+
     def _build_ui(self):
         # Tema visual modern untuk desktop Linux.
         self.root.configure(bg="#F3F6FC")
@@ -249,7 +299,37 @@ class RemoteControlApp:
             dashboard_tab, text="Informasi HP", padding=12
         )
         info_frame.pack(fill="x", pady=4)
+        mem_tab = ttk.Frame(notebook)
+        notebook.add(mem_tab, text="Manajemen Memori")
 
+        mem_top = ttk.Frame(mem_tab, padding=10)
+        mem_top.pack(fill="x")
+
+        ttk.Label(mem_top, text="Inspeksi Alokasi Memori Fisik & Swapping (Virtual Memory)", font=("Arial", 11, "bold")).pack(anchor="w")
+        ttk.Label(mem_top, text="Menganalisis penggunaan RAM, ruang swap, dan cache berdasarkan struktur kernel /proc/meminfo.").pack(anchor="w", pady=(0, 10))
+
+        ttk.Button(mem_top, text="Muat Informasi Memori", command=self.load_memory_info).pack(anchor="w")
+
+        # Frame Tabel Memori
+        mem_frame = ttk.Frame(mem_tab, padding=10)
+        mem_frame.pack(fill="both", expand=True)
+
+        mem_columns = ("Parameter", "Nilai (Value)", "Keterangan Konsep OS")
+        self.mem_tree = ttk.Treeview(mem_frame, columns=mem_columns, show="headings", height=12)
+
+        self.mem_tree.heading("Parameter", text="Parameter Memori")
+        self.mem_tree.heading("Nilai (Value)", text="Nilai (Value)")
+        self.mem_tree.heading("Keterangan Konsep OS", text="Keterangan Konsep OS")
+
+        self.mem_tree.column("Parameter", width=350, anchor="w", stretch=False)
+        self.mem_tree.column("Nilai (Value)", width=250, anchor="w", stretch=False)
+        self.mem_tree.column("Keterangan Konsep OS", width=400, anchor="w", stretch=True)
+
+        mem_scroll = ttk.Scrollbar(mem_frame, orient="vertical", command=self.mem_tree.yview)
+        self.mem_tree.configure(yscrollcommand=mem_scroll.set)
+
+        self.mem_tree.pack(side="left", fill="both", expand=True)
+        mem_scroll.pack(side="right", fill="y")
         # Tab Baru: Sinkronisasi & Concurrency
         sync_tab = ttk.Frame(notebook)
         notebook.add(sync_tab, text="Sinkronisasi OS")
@@ -324,21 +404,24 @@ class RemoteControlApp:
 
         self.proc_tree = ttk.Treeview(
             tree_frame, 
-            columns=("PID", "USER", "STATUS", "NICE", "COMMAND"), 
-            show="headings", 
+            columns=("PID", "USER", "STATUS", "NICE", "CPU (%)", "Command / Nama Proses"),
+            show="headings",
             height=30
         )
+
         self.proc_tree.heading("PID", text="PID")
         self.proc_tree.heading("USER", text="User")
         self.proc_tree.heading("STATUS", text="Status")
         self.proc_tree.heading("NICE", text="Nice (NI)")
-        self.proc_tree.heading("COMMAND", text="Command / Nama Proses")
+        self.proc_tree.heading("CPU (%)", text="CPU (%)")
+        self.proc_tree.heading("Command / Nama Proses", text="Command / Nama Proses")
 
         self.proc_tree.column("PID", width=100, anchor="center", stretch=False)
         self.proc_tree.column("USER", width=120, anchor="center", stretch=False)
         self.proc_tree.column("STATUS", width=100, anchor="center", stretch=False)
         self.proc_tree.column("NICE", width=180, anchor="center", stretch=False)
-        self.proc_tree.column("COMMAND", width=600, anchor="w", stretch=True)
+        self.proc_tree.column("CPU (%)", width=80, anchor="center", stretch=False)
+        self.proc_tree.column("Command / Nama Proses", width=600, anchor="w", stretch=True)
 
         proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
         self.proc_tree.configure(yscrollcommand=proc_scroll.set)
@@ -680,22 +763,50 @@ class RemoteControlApp:
         self.timer_job = self.root.after(1000, self._tick_timer)
 
     def load_processes(self):
-        """Mengambil daftar proses aktif dari Android via ADB (mirip perintah ps di OS Linux)."""
+        """Mengambil daftar proses aktif dan penggunaan CPU (%) dari Android via ADB."""
         try:
-            output = self.run_adb(["shell", "ps", "-eo", "USER,PID,S,NI,NAME"], timeout=20)
+            # Menggunakan perintah top -n 1 (snapshot 1 iterasi) untuk mendapatkan beban CPU per proses
+            output = self.run_adb(["shell", "top", "-n", "1", "-b"], timeout=15)
+
             for item in self.proc_tree.get_children():
                 self.proc_tree.delete(item)
 
             lines = output.splitlines()
-            for line in lines[1:]:
-                parts = line.split(None, 4)
-                if len(parts) >= 5:
-                    user, pid, status, nice, name = parts
-                    self.proc_tree.insert("", "end", values=(pid, user, status, nice, name))
+            data_started = False
 
-            self.status.set(f"Berhasil memuat tabel proses sistem Android.")
+            for line in lines:
+                # Deteksi baris header dari perintah top Android
+                if "PID" in line and ("CPU" in line or "COMMAND" in line or "NAME" in line):
+                    data_started = True
+                    continue
+
+                if data_started and line.strip():
+                    parts = line.split(None, 9)
+                    if len(parts) >= 9:
+                        pid = parts[0]
+                        status = parts[3]
+                        cpu_pct = parts[2] + "%"  # Nilai persentase penggunaan CPU
+                        name = parts[8] if len(parts) > 8 else "Unknown"
+                        user = "system"
+                        nice = "0"
+
+                        self.proc_tree.insert("", "end", values=(pid, user, status, nice, cpu_pct, name))
+
+            self.status.set("Berhasil memuat daftar proses dan penggunaan CPU perangkat.")
         except Exception as exc:
-            self.show_error("Gagal memuat proses", exc)
+            # Fallback otomatis ke ps jika top mengalami kendala di versi Android tertentu
+            try:
+                output = self.run_adb(["shell", "ps", "-eo", "PID,USER,S,NI,NAME"], timeout=10)
+                for item in self.proc_tree.get_children():
+                    self.proc_tree.delete(item)
+                for line in output.splitlines()[1:]:
+                    parts = line.split(None, 4)
+                    if len(parts) >= 5:
+                        pid, user, status, nice, name = parts
+                        self.proc_tree.insert("", "end", values=(pid, user, status, nice, "N/A", name))
+                self.status.set("Memuat proses via ps (fallback mode).")
+            except Exception as inner_exc:
+                self.show_error("Gagal memuat proses", inner_exc)
 
     def change_process_priority(self):
         """Mengubah nilai nice suatu proses untuk simulasi penjadwalan CPU."""
