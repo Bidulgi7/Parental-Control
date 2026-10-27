@@ -4,6 +4,7 @@
 import os
 import subprocess
 import threading
+import queue
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -13,6 +14,11 @@ APP_TITLE = "Android Remote Control Center"
 
 class RemoteControlApp:
     def __init__(self, root):
+        self.cmd_queue = queue.Queue()
+        self.mutex = threading.Lock()
+        self.is_worker_running = True
+        self.worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
+        self.worker_thread.start()
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1000x720")
@@ -28,6 +34,61 @@ class RemoteControlApp:
         self.refresh_devices()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_dashboard_loop()
+    def _queue_worker(self):
+        """Worker thread yang memproses antrean perintah secara sinkron menggunakan Mutex."""
+        while getattr(self, 'is_worker_running', True):
+            try:
+                task = self.cmd_queue.get(timeout=0.5)
+                if task is None:
+                    break
+
+                func, args, callback = task
+
+                # KRITIKAL SECTION: Dilindungi oleh Mutex Lock
+                with self.mutex:
+                    try:
+                        result = func(*args)
+                        if callback:
+                            self.root.after(0, lambda res=result: callback(True, res))
+                    except Exception as exc:
+                        error_msg = str(exc)
+                        if callback:
+                            self.root.after(0, lambda err=error_msg: callback(False, err))
+
+                self.cmd_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception:
+                pass
+
+    def submit_to_queue(self, func, args=(), callback=None):
+        """Memasukkan tugas baru ke dalam antrean (Queue) sistem."""
+        if not hasattr(self, 'cmd_queue'):
+            import queue
+            self.cmd_queue = queue.Queue()
+        self.cmd_queue.put((func, args, callback))
+        self.status.set(f"Tugas dimasukkan ke antrean (Total pending: {self.cmd_queue.qsize()})")
+
+    def test_concurrency_sync(self):
+        """Fungsi simulasi uji coba konkurensi dan mutex."""
+        def dummy_adb_task(task_id):
+            import time
+            time.sleep(1)
+            return f"Task #{task_id} berhasil dieksekusi dengan aman melalui Proteksi Mutex Lock."
+
+        def on_task_finished(success, res):
+            if hasattr(self, 'sync_log'):
+                self.sync_log.insert(tk.END, f"[SYNC/MUTEX] {res}\n")
+                self.sync_log.see(tk.END)
+
+        for i in range(1, 4):
+            self.submit_to_queue(dummy_adb_task, args=(i,), callback=on_task_finished)
+
+    def log_sync_output(self, message):
+        """Menampilkan hasil log sinkronisasi ke text box."""
+        if hasattr(self, 'sync_log'):
+            self.sync_log.insert(tk.END, f"[SYNC/MUTEX] {message}\n")
+            self.sync_log.see(tk.END)
 
     def _build_ui(self):
         # Tema visual modern untuk desktop Linux.
@@ -35,6 +96,7 @@ class RemoteControlApp:
 
         style = ttk.Style()
         style.theme_use("clam")
+        style.configure("Treeview", rowheight=35)
 
         BG = "#F3F6FC"
         CARD = "#FFFFFF"
@@ -188,6 +250,32 @@ class RemoteControlApp:
         )
         info_frame.pack(fill="x", pady=4)
 
+        # Tab Baru: Sinkronisasi & Concurrency
+        sync_tab = ttk.Frame(notebook)
+        notebook.add(sync_tab, text="Sinkronisasi OS")
+
+        sync_top = ttk.Frame(sync_tab, padding=10)
+        sync_top.pack(fill="x")
+
+        ttk.Label(sync_top, text="Simulasi Antrean Proses (Queue) & Proteksi Mutex Lock", font=("Arial", 11, "bold")).pack(anchor="w")
+        ttk.Label(sync_top, text="Mengatur eksekusi perintah konkuren agar tidak terjadi bentrok sumber daya (race condition).").pack(anchor="w", pady=(0, 10))
+
+        ttk.Button(sync_top, text="Jalankan Simulasi Antrean Konkuren", command=self.test_concurrency_sync).pack(anchor="w")
+        # Area Log Konsol
+        sync_frame = ttk.Frame(sync_tab, padding=10)
+        sync_frame.pack(fill="both", expand=True)
+
+        # 1. Buat Scrollbar terlebih dahulu
+        sync_scroll = ttk.Scrollbar(sync_frame, orient="vertical")
+        sync_scroll.pack(side="right", fill="y")
+
+        # 2. Buat widget Text dan hubungkan ke scrollbar
+        self.sync_log = tk.Text(sync_frame, wrap="word", bg="#1e1e1e", fg="#00ff00", font=("Courier", 10), yscrollcommand=sync_scroll.set)
+        self.sync_log.pack(side="left", fill="both", expand=True)
+
+        # 3. Konfigurasi aksi scrollbar
+        sync_scroll.config(command=self.sync_log.yview)
+
         for label, variable in [
             ("Status koneksi", self.dashboard_connection),
             ("Model perangkat", self.dashboard_model),
@@ -220,7 +308,7 @@ class RemoteControlApp:
                  "perangkat, bukan mengunci HP secara permanen.",
             wraplength=850
         ).pack(anchor="w", pady=8)
-process_tab = ttk.Frame(notebook, padding=12)
+        process_tab = ttk.Frame(notebook, padding=12)
         notebook.add(process_tab, text="Manajemen Proses & CPU")
 
         ttk.Label(process_tab, text="Daftar Proses Android & Penjadwalan (Process Table)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
@@ -238,7 +326,7 @@ process_tab = ttk.Frame(notebook, padding=12)
             tree_frame, 
             columns=("PID", "USER", "STATUS", "NICE", "COMMAND"), 
             show="headings", 
-            height=15
+            height=30
         )
         self.proc_tree.heading("PID", text="PID")
         self.proc_tree.heading("USER", text="User")
@@ -246,15 +334,14 @@ process_tab = ttk.Frame(notebook, padding=12)
         self.proc_tree.heading("NICE", text="Nice (NI)")
         self.proc_tree.heading("COMMAND", text="Command / Nama Proses")
 
-        self.proc_tree.column("PID", width=70, anchor="center")
-        self.proc_tree.column("USER", width=100, anchor="w")
-        self.proc_tree.column("STATUS", width=70, anchor="center")
-        self.proc_tree.column("NICE", width=70, anchor="center")
-        self.proc_tree.column("COMMAND", width=350, anchor="w")
+        self.proc_tree.column("PID", width=100, anchor="center", stretch=False)
+        self.proc_tree.column("USER", width=120, anchor="center", stretch=False)
+        self.proc_tree.column("STATUS", width=100, anchor="center", stretch=False)
+        self.proc_tree.column("NICE", width=180, anchor="center", stretch=False)
+        self.proc_tree.column("COMMAND", width=600, anchor="w", stretch=True)
 
         proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
         self.proc_tree.configure(yscrollcommand=proc_scroll.set)
-        
         self.proc_tree.pack(side="left", fill="both", expand=True)
         proc_scroll.pack(side="right", fill="y")
         notebook.add(files_tab, text="Transfer File")
@@ -591,11 +678,11 @@ process_tab = ttk.Frame(notebook, padding=12)
                 self.lock_screen()
             return
         self.timer_job = self.root.after(1000, self._tick_timer)
-def load_processes(self):
+
+    def load_processes(self):
         """Mengambil daftar proses aktif dari Android via ADB (mirip perintah ps di OS Linux)."""
         try:
             output = self.run_adb(["shell", "ps", "-eo", "USER,PID,S,NI,NAME"], timeout=20)
-            
             for item in self.proc_tree.get_children():
                 self.proc_tree.delete(item)
 
@@ -616,7 +703,7 @@ def load_processes(self):
         if not selected_item:
             messagebox.showinfo("Pilih Proses", "Pilih salah satu baris proses dari tabel terlebih dahulu.", parent=self.root)
             return
-        
+
         item_data = self.proc_tree.item(selected_item[0])['values']
         pid = item_data[0]
         name = item_data[4]
