@@ -4,25 +4,30 @@
 import os
 import subprocess
 import threading
-import queue
 import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+from adb_helper import run_adb_cmd, get_adb_devices
+from os_features import OSFeaturesHandler
 
 APP_TITLE = "Android Remote Control Center"
 
 
 class RemoteControlApp:
     def __init__(self, root):
-        self.cmd_queue = queue.Queue()
-        self.mutex = threading.Lock()
-        self.is_worker_running = True
-        self.worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
-        self.worker_thread.start()
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1000x720")
         self.root.minsize(820, 600)
+
+        # Inisialisasi Modul OS Features
+        self.os_handler = OSFeaturesHandler(self.run_adb)
+        self.worker_thread = threading.Thread(
+            target=self.os_handler.queue_worker, args=(self.root,), daemon=True
+        )
+        self.worker_thread.start()
+
         self.device = tk.StringVar()
         self.status = tk.StringVar(value="Sambungkan HP melalui USB, aktifkan USB Debugging, lalu Refresh.")
         self.minutes = tk.StringVar(value="30")
@@ -30,49 +35,32 @@ class RemoteControlApp:
         self.timer_start = None
         self.timer_job = None
         self.packages = []
+
         self._build_ui()
         self.refresh_devices()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_dashboard_loop()
-    def _queue_worker(self):
-        """Worker thread yang memproses antrean perintah secara sinkron menggunakan Mutex."""
-        while getattr(self, 'is_worker_running', True):
-            try:
-                task = self.cmd_queue.get(timeout=0.5)
-                if task is None:
-                    break
 
-                func, args, callback = task
+    def run_adb(self, device_id, *, args, timeout=15):
+        """Menjembatani pemanggilan ADB dari modul OS ke modul pembantu."""
+        # Modul OS memanggil dengan device_id sebagai argumen pertama
+        return run_adb_cmd(device_id, args=args, timeout=timeout)
 
-                # KRITIKAL SECTION: Dilindungi oleh Mutex Lock
-                with self.mutex:
-                    try:
-                        result = func(*args)
-                        if callback:
-                            self.root.after(0, lambda res=result: callback(True, res))
-                    except Exception as exc:
-                        error_msg = str(exc)
-                        if callback:
-                            self.root.after(0, lambda err=error_msg: callback(False, err))
+    def run_adb_local(self, args, timeout=15):
+        """Fungsi pembantu lokal untuk perintah ADB yang menggunakan perangkat terpilih."""
+        device_id = self.device.get().strip()
+        return run_adb_cmd(device_id, args=args, timeout=timeout)
 
-                self.cmd_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception:
-                pass
+    def show_error(self, title, error):
+        self.status.set(str(error))
+        messagebox.showerror(title, str(error), parent=self.root)
 
     def submit_to_queue(self, func, args=(), callback=None):
-        """Memasukkan tugas baru ke dalam antrean (Queue) sistem."""
-        if not hasattr(self, 'cmd_queue'):
-            import queue
-            self.cmd_queue = queue.Queue()
-        self.cmd_queue.put((func, args, callback))
-        self.status.set(f"Tugas dimasukkan ke antrean (Total pending: {self.cmd_queue.qsize()})")
+        self.os_handler.submit_to_queue(func, args, callback)
+        self.status.set(f"Tugas dimasukkan ke antrean (Total pending: {self.os_handler.cmd_queue.qsize()})")
 
     def test_concurrency_sync(self):
-        """Fungsi simulasi uji coba konkurensi dan mutex."""
         def dummy_adb_task(task_id):
-            import time
             time.sleep(1)
             return f"Task #{task_id} berhasil dieksekusi dengan aman melalui Proteksi Mutex Lock."
 
@@ -84,454 +72,65 @@ class RemoteControlApp:
         for i in range(1, 4):
             self.submit_to_queue(dummy_adb_task, args=(i,), callback=on_task_finished)
 
-    def log_sync_output(self, message):
-        """Menampilkan hasil log sinkronisasi ke text box."""
-        if hasattr(self, 'sync_log'):
-            self.sync_log.insert(tk.END, f"[SYNC/MUTEX] {message}\n")
-            self.sync_log.see(tk.END)
-
     def load_memory_info(self):
-        """Mengambil informasi manajemen memori dan swapping dari kernel Android (/proc/meminfo)."""
         try:
-            # Eksekusi perintah adb shell untuk membaca meminfo
-            output = self.run_adb(["shell", "cat", "/proc/meminfo"], timeout=10)
+            device_id = self.device.get().strip()
+            memory_data = self.os_handler.get_memory_info(device_id)
 
-            # Bersihkan isi tabel atau widget sebelumnya
             for item in self.mem_tree.get_children():
                 self.mem_tree.delete(item)
 
-            # Parsing baris per baris dari /proc/meminfo
-            memory_data = {}
-            for line in output.splitlines():
-                parts = line.split(":")
-                if len(parts) == 2:
-                    key = parts[0].strip()
-                    val = parts[1].strip()
-                    memory_data[key] = val
-
-            # Filter parameter penting untuk Teori OS (RAM & Swapping)
             target_keys = [
-                "MemTotal", "MemFree", "MemAvailable", "Buffers", 
+                "MemTotal", "MemFree", "MemAvailable", "Buffers",
                 "Cached", "SwapTotal", "SwapFree", "VmallocTotal", "VmallocUsed"
             ]
 
             for key in target_keys:
                 if key in memory_data:
-                    # Berikan keterangan deskriptif ala OS
-                    desc = self._get_memory_description(key)
+                    desc = self.os_handler.get_memory_description(key)
                     self.mem_tree.insert("", "end", values=(key, memory_data[key], desc))
 
             self.status.set("Berhasil memuat data manajemen memori dan swapping Android.")
         except Exception as exc:
             self.show_error("Gagal memuat info memori", exc)
 
-    def _get_memory_description(self, key):
-        """Memberikan penjelasan teoretis OS untuk setiap parameter memori."""
-        descriptions = {
-            "MemTotal": "Total kapasitas RAM fisik yang dapat diakses oleh sistem operasi.",
-            "MemFree": "Kapasitas RAM murni yang belum digunakan sama sekali.",
-            "MemAvailable": "Estimasi RAM yang tersedia untuk menjalankan aplikasi baru tanpa swapping.",
-            "Buffers": "Memori RAM yang dialokasikan untuk buffer blok disk I/O.",
-            "Cached": "Memori RAM yang digunakan untuk cache file sistem/kernel.",
-            "SwapTotal": "Total kapasitas ruang swap (memori virtual cadangan di storage).",
-            "SwapFree": "Kapasitas ruang swap yang saat ini masih kosong/belum terpakai.",
-            "VmallocTotal": "Total ruang memori virtual yang dialokasikan kernel.",
-            "VmallocUsed": "Ruang memori virtual kernel yang sedang terpakai."
-        }
-        return descriptions.get(key, "Parameter manajemen memori kernel Linux.")
+    def load_processes(self):
+        try:
+            device_id = self.device.get().strip()
+            processes = self.os_handler.get_process_table(device_id)
 
-    def _build_ui(self):
-        # Tema visual modern untuk desktop Linux.
-        self.root.configure(bg="#F3F6FC")
+            for item in self.proc_tree.get_children():
+                self.proc_tree.delete(item)
 
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Treeview", rowheight=35)
+            for proc in processes:
+                self.proc_tree.insert("", "end", values=proc)
 
-        BG = "#F3F6FC"
-        CARD = "#FFFFFF"
-        NAVY = "#17243A"
-        BLUE = "#356DF3"
-        TEXT = "#243149"
-        MUTED = "#68758B"
-        BORDER = "#DCE4F0"
+            self.status.set("Berhasil memuat daftar proses dan penggunaan CPU perangkat.")
+        except Exception as exc:
+            self.show_error("Gagal memuat proses", exc)
 
-        style.configure(".", font=("DejaVu Sans", 10))
-        style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure(
-            "Header.TLabel",
-            background=BG,
-            foreground=NAVY,
-            font=("DejaVu Sans", 21, "bold")
-        )
-        style.configure(
-            "Subtitle.TLabel",
-            background=BG,
-            foreground=MUTED,
-            font=("DejaVu Sans", 9)
-        )
-        style.configure(
-            "TLabelframe",
-            background=CARD,
-            bordercolor=BORDER,
-            relief="solid",
-            borderwidth=1
-        )
-        style.configure(
-            "TLabelframe.Label",
-            background=CARD,
-            foreground=NAVY,
-            font=("DejaVu Sans", 10, "bold")
-        )
-        style.configure(
-            "TButton",
-            background=CARD,
-            foreground=TEXT,
-            bordercolor=BORDER,
-            padding=(13, 8),
-            relief="flat",
-            font=("DejaVu Sans", 9, "bold")
-        )
-        style.map(
-            "TButton",
-            background=[("active", "#E8EEFF"), ("pressed", "#D8E3FF")],
-            foreground=[("disabled", "#9AA5B5")]
-        )
-        style.configure(
-            "Accent.TButton",
-            background=BLUE,
-            foreground="#FFFFFF",
-            bordercolor=BLUE,
-            padding=(14, 9)
-        )
-        style.map(
-            "Accent.TButton",
-            background=[("active", "#2559D9"), ("pressed", "#1E49B7")],
-            foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")]
-        )
-        style.configure(
-            "TNotebook",
-            background=BG,
-            borderwidth=0,
-            tabmargins=(2, 5, 2, 0)
-        )
-        style.configure(
-            "TNotebook.Tab",
-            background="#E8EDF6",
-            foreground=MUTED,
-            padding=(15, 10),
-            font=("DejaVu Sans", 9, "bold")
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", CARD), ("active", "#DCE6FA")],
-            foreground=[("selected", BLUE), ("active", NAVY)]
-        )
-        style.configure(
-            "TEntry",
-            fieldbackground=CARD,
-            foreground=TEXT,
-            bordercolor=BORDER,
-            padding=7
-        )
-        style.configure(
-            "TCombobox",
-            fieldbackground=CARD,
-            background=CARD,
-            foreground=TEXT,
-            padding=6
-        )
-        style.configure(
-            "Vertical.TScrollbar",
-            background="#D9E2F0",
-            troughcolor=BG,
-            bordercolor=BG,
-            arrowsize=13
-        )
+    def change_process_priority(self):
+        selected_item = self.proc_tree.selection()
+        if not selected_item:
+            messagebox.showinfo("Pilih Proses", "Pilih salah satu baris proses dari tabel terlebih dahulu.", parent=self.root)
+            return
 
-        header = ttk.Frame(self.root, padding=12)
-        header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(anchor="w")
-        ttk.Label(
-            header,
-            text="USB + ADB • Gunakan hanya pada perangkat milikmu atau yang kamu punya izin untuk kelola.",
-            wraplength=940, style="Subtitle.TLabel"
-        ).pack(anchor="w", pady=(4, 8))
+        item_data = self.proc_tree.item(selected_item[0])['values']
+        pid = item_data[0]
+        name = item_data[5]
 
-        device_frame = ttk.LabelFrame(self.root, text="Perangkat Android", padding=10)
-        device_frame.pack(fill="x", padx=12, pady=4)
-        ttk.Label(device_frame, text="Device ID:").pack(side="left")
-        self.device_combo = ttk.Combobox(
-            device_frame, textvariable=self.device, state="readonly", width=32
-        )
-        self.device_combo.pack(side="left", padx=8)
-        ttk.Button(device_frame, text="Refresh", command=self.refresh_devices).pack(side="left")
-        ttk.Button(device_frame, text="Info perangkat", command=self.device_info).pack(side="left", padx=6)
-        ttk.Label(device_frame, textvariable=self.status, wraplength=450).pack(
-            side="left", padx=12, fill="x", expand=True
-        )
-
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=12, pady=8)
-
-        dashboard_tab = ttk.Frame(notebook, padding=16)
-        mirror_tab = ttk.Frame(notebook, padding=12)
-        apps_tab = ttk.Frame(notebook, padding=12)
-        files_tab = ttk.Frame(notebook, padding=12)
-        usage_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(dashboard_tab, text="Dashboard")
-        notebook.add(mirror_tab, text="Mirroring & Kontrol")
-        notebook.add(apps_tab, text="Aplikasi")
-
-        ttk.Label(
-            dashboard_tab, text="Ringkasan Perangkat",
-            font=("TkDefaultFont", 16, "bold")
-        ).pack(anchor="w", pady=(0, 12))
-
-        self.dashboard_connection = tk.StringVar(value="Memeriksa koneksi...")
-        self.dashboard_model = tk.StringVar(value="-")
-        self.dashboard_android = tk.StringVar(value="-")
-        self.dashboard_battery = tk.StringVar(value="-")
-        self.dashboard_storage = tk.StringVar(value="-")
-
-        info_frame = ttk.LabelFrame(
-            dashboard_tab, text="Informasi HP", padding=12
-        )
-        info_frame.pack(fill="x", pady=4)
-        mem_tab = ttk.Frame(notebook)
-        notebook.add(mem_tab, text="Manajemen Memori")
-
-        mem_top = ttk.Frame(mem_tab, padding=10)
-        mem_top.pack(fill="x")
-
-        ttk.Label(mem_top, text="Inspeksi Alokasi Memori Fisik & Swapping (Virtual Memory)", font=("Arial", 11, "bold")).pack(anchor="w")
-        ttk.Label(mem_top, text="Menganalisis penggunaan RAM, ruang swap, dan cache berdasarkan struktur kernel /proc/meminfo.").pack(anchor="w", pady=(0, 10))
-
-        ttk.Button(mem_top, text="Muat Informasi Memori", command=self.load_memory_info).pack(anchor="w")
-
-        # Frame Tabel Memori
-        mem_frame = ttk.Frame(mem_tab, padding=10)
-        mem_frame.pack(fill="both", expand=True)
-
-        mem_columns = ("Parameter", "Nilai (Value)", "Keterangan Konsep OS")
-        self.mem_tree = ttk.Treeview(mem_frame, columns=mem_columns, show="headings", height=12)
-
-        self.mem_tree.heading("Parameter", text="Parameter Memori")
-        self.mem_tree.heading("Nilai (Value)", text="Nilai (Value)")
-        self.mem_tree.heading("Keterangan Konsep OS", text="Keterangan Konsep OS")
-
-        self.mem_tree.column("Parameter", width=350, anchor="w", stretch=False)
-        self.mem_tree.column("Nilai (Value)", width=250, anchor="w", stretch=False)
-        self.mem_tree.column("Keterangan Konsep OS", width=400, anchor="w", stretch=True)
-
-        mem_scroll = ttk.Scrollbar(mem_frame, orient="vertical", command=self.mem_tree.yview)
-        self.mem_tree.configure(yscrollcommand=mem_scroll.set)
-
-        self.mem_tree.pack(side="left", fill="both", expand=True)
-        mem_scroll.pack(side="right", fill="y")
-        # Tab Baru: Sinkronisasi & Concurrency
-        sync_tab = ttk.Frame(notebook)
-        notebook.add(sync_tab, text="Sinkronisasi OS")
-
-        sync_top = ttk.Frame(sync_tab, padding=10)
-        sync_top.pack(fill="x")
-
-        ttk.Label(sync_top, text="Simulasi Antrean Proses (Queue) & Proteksi Mutex Lock", font=("Arial", 11, "bold")).pack(anchor="w")
-        ttk.Label(sync_top, text="Mengatur eksekusi perintah konkuren agar tidak terjadi bentrok sumber daya (race condition).").pack(anchor="w", pady=(0, 10))
-
-        ttk.Button(sync_top, text="Jalankan Simulasi Antrean Konkuren", command=self.test_concurrency_sync).pack(anchor="w")
-        # Area Log Konsol
-        sync_frame = ttk.Frame(sync_tab, padding=10)
-        sync_frame.pack(fill="both", expand=True)
-
-        # 1. Buat Scrollbar terlebih dahulu
-        sync_scroll = ttk.Scrollbar(sync_frame, orient="vertical")
-        sync_scroll.pack(side="right", fill="y")
-
-        # 2. Buat widget Text dan hubungkan ke scrollbar
-        self.sync_log = tk.Text(sync_frame, wrap="word", bg="#1e1e1e", fg="#00ff00", font=("Courier", 10), yscrollcommand=sync_scroll.set)
-        self.sync_log.pack(side="left", fill="both", expand=True)
-
-        # 3. Konfigurasi aksi scrollbar
-        sync_scroll.config(command=self.sync_log.yview)
-
-        for label, variable in [
-            ("Status koneksi", self.dashboard_connection),
-            ("Model perangkat", self.dashboard_model),
-            ("Versi Android", self.dashboard_android),
-            ("Baterai", self.dashboard_battery),
-            ("Penyimpanan /data", self.dashboard_storage),
-        ]:
-            line = ttk.Frame(info_frame)
-            line.pack(fill="x", pady=5)
-            ttk.Label(line, text=label, width=22).pack(side="left")
-            ttk.Label(
-                line, textvariable=variable,
-                font=("TkDefaultFont", 10, "bold")
-            ).pack(side="left", fill="x", expand=True)
-
-        dashboard_buttons = ttk.Frame(dashboard_tab)
-        dashboard_buttons.pack(fill="x", pady=12)
-        ttk.Button(
-            dashboard_buttons, text="Perbarui informasi",
-            command=self.refresh_dashboard
-        ).pack(side="left")
-        ttk.Button(
-            dashboard_buttons, text="Refresh perangkat",
-            command=self.refresh_devices
-        ).pack(side="left", padx=8)
-
-        ttk.Label(
-            dashboard_tab,
-            text="Informasi diperoleh melalui ADB. Dashboard ini memantau "
-                 "perangkat, bukan mengunci HP secara permanen.",
-            wraplength=850
-        ).pack(anchor="w", pady=8)
-        process_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(process_tab, text="Manajemen Proses & CPU")
-
-        ttk.Label(process_tab, text="Daftar Proses Android & Penjadwalan (Process Table)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
-        ttk.Label(process_tab, text="Menampilkan informasi PID, Status, dan Prioritas (Nice Value) proses yang berjalan di kernel Android.").pack(anchor="w", pady=4)
-
-        proc_top = ttk.Frame(process_tab)
-        proc_top.pack(fill="x", pady=6)
-        ttk.Button(proc_top, text="Muat Proses (PS)", command=self.load_processes).pack(side="left")
-        ttk.Button(proc_top, text="Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
-
-        tree_frame = ttk.Frame(process_tab)
-        tree_frame.pack(fill="both", expand=True, pady=4)
-
-        self.proc_tree = ttk.Treeview(
-            tree_frame, 
-            columns=("PID", "USER", "STATUS", "NICE", "CPU (%)", "Command / Nama Proses"),
-            show="headings",
-            height=30
-        )
-
-        self.proc_tree.heading("PID", text="PID")
-        self.proc_tree.heading("USER", text="User")
-        self.proc_tree.heading("STATUS", text="Status")
-        self.proc_tree.heading("NICE", text="Nice (NI)")
-        self.proc_tree.heading("CPU (%)", text="CPU (%)")
-        self.proc_tree.heading("Command / Nama Proses", text="Command / Nama Proses")
-
-        self.proc_tree.column("PID", width=100, anchor="center", stretch=False)
-        self.proc_tree.column("USER", width=120, anchor="center", stretch=False)
-        self.proc_tree.column("STATUS", width=100, anchor="center", stretch=False)
-        self.proc_tree.column("NICE", width=180, anchor="center", stretch=False)
-        self.proc_tree.column("CPU (%)", width=80, anchor="center", stretch=False)
-        self.proc_tree.column("Command / Nama Proses", width=600, anchor="w", stretch=True)
-
-        proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
-        self.proc_tree.configure(yscrollcommand=proc_scroll.set)
-        self.proc_tree.pack(side="left", fill="both", expand=True)
-        proc_scroll.pack(side="right", fill="y")
-        notebook.add(files_tab, text="Transfer File")
-        notebook.add(usage_tab, text="Screen Time")
-
-        ttk.Label(mirror_tab, text="Mirroring menggunakan scrcpy", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
-        ttk.Label(
-            mirror_tab,
-            text="scrcpy membuka jendela layar HP terpisah dan meneruskan klik, scroll, serta ketikan keyboard."
-        ).pack(anchor="w", pady=6)
-        row = ttk.Frame(mirror_tab)
-        row.pack(anchor="w", pady=8)
-        ttk.Button(row, text="Mulai mirroring", command=self.start_mirroring).pack(side="left", padx=(0, 8))
-        ttk.Button(row, text="Mirroring + layar HP mati", command=self.start_mirroring_screen_off).pack(side="left", padx=8)
-        ttk.Button(row, text="Kunci layar HP", command=self.lock_screen).pack(side="left", padx=8)
-        ttk.Button(row, text="Bangunkan layar", command=self.wake_screen).pack(side="left", padx=8)
-        ttk.Label(
-            mirror_tab,
-            text="Catatan: opsi layar mati bergantung pada versi scrcpy/Android. Tutup jendela scrcpy untuk menghentikan sesi."
-        ).pack(anchor="w", pady=10)
-
-        app_top = ttk.Frame(apps_tab)
-        app_top.pack(fill="x")
-        ttk.Label(app_top, text="Daftar aplikasi pihak ketiga pada HP:").pack(side="left")
-        ttk.Button(app_top, text="Muat daftar", command=self.load_packages).pack(side="left", padx=8)
-        ttk.Button(app_top, text="Force stop terpilih", command=self.force_stop_selected).pack(side="left", padx=4)
-        ttk.Label(
-            apps_tab,
-            text="Force stop hanya menghentikan aplikasi sementara; aplikasi dapat dibuka lagi dari HP."
-        ).pack(anchor="w", pady=6)
-        list_frame = ttk.Frame(apps_tab)
-        list_frame.pack(fill="both", expand=True, pady=4)
-        self.package_list = tk.Listbox(
-            list_frame,
-            selectmode=tk.EXTENDED,
-            height=18,
-            bg="#FFFFFF",
-            fg="#243149",
-            selectbackground="#356DF3",
-            selectforeground="#FFFFFF",
-            highlightbackground="#DCE4F0",
-            highlightcolor="#356DF3",
-            relief="flat",
-            borderwidth=1,
-            font=("DejaVu Sans Mono", 10),
-            activestyle="none"
-        )
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.package_list.yview)
-        self.package_list.configure(yscrollcommand=scrollbar.set)
-        self.package_list.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        ttk.Label(files_tab, text="Kirim file dari laptop ke folder Download HP.").pack(anchor="w")
-        ttk.Button(files_tab, text="Pilih file lalu kirim ke HP", command=self.push_file).pack(anchor="w", pady=8)
-        ttk.Label(files_tab, text="Pilih APK untuk memasangnya pada HP yang terhubung.").pack(anchor="w", pady=(16, 0))
-        ttk.Button(files_tab, text="Pilih APK lalu instal", command=self.install_apk).pack(anchor="w", pady=8)
-        ttk.Label(
-            files_tab,
-            text="Transfer dan instalasi memerlukan perangkat berstatus 'device' di ADB. APK tetap perlu izin instalasi yang sesuai."
-        ).pack(anchor="w", pady=8)
-
-        ttk.Label(usage_tab, text="Timer sesi pemantauan", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
-        ttk.Label(usage_tab, text="Timer ini menghitung sesi sejak tombol Mulai ditekan, bukan total penggunaan harian Android.").pack(anchor="w", pady=6)
-        time_row = ttk.Frame(usage_tab)
-        time_row.pack(anchor="w", pady=8)
-        ttk.Label(time_row, text="Batas sesi (menit):").pack(side="left")
-        ttk.Entry(time_row, textvariable=self.minutes, width=8).pack(side="left", padx=8)
-        ttk.Button(time_row, text="Mulai timer", command=self.start_timer).pack(side="left", padx=4)
-        ttk.Button(time_row, text="Hentikan timer", command=self.stop_timer).pack(side="left", padx=4)
-        self.timer_label = ttk.Label(usage_tab, text="00:00", font=("TkDefaultFont", 24, "bold"))
-        self.timer_label.pack(anchor="w", pady=12)
-        ttk.Label(usage_tab, text="Saat batas tercapai, aplikasi meminta konfirmasi sebelum mengunci layar HP.").pack(anchor="w")
-
-        footer = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        footer.pack(fill="x")
-        ttk.Separator(footer).pack(fill="x", pady=(0, 8))
-        ttk.Label(footer, text="Status: ADB hanya berfungsi setelah otorisasi USB Debugging disetujui pada HP.").pack(anchor="w")
-
-    def run_adb(self, args, timeout=15):
-        device = self.device.get().strip()
-        if not device:
-            raise RuntimeError("Pilih perangkat terlebih dahulu.")
-        command = ["adb", "-s", device, *args]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(detail or "Perintah ADB gagal.")
-        return result.stdout.strip()
-
-    def show_error(self, title, error):
-        self.status.set(str(error))
-        messagebox.showerror(title, str(error), parent=self.root)
+        new_nice = simpledialog.askinteger("Ubah Prioritas (Nice)", f"PID {pid} ({name}):\nMasukkan nilai Nice (-20 sampai 19):", minvalue=-20, maxvalue=19, parent=self.root)
+        if new_nice is not None:
+            try:
+                self.run_adb_local(["shell", "renice", str(new_nice), str(pid)], timeout=10)
+                self.status.set(f"Prioritas PID {pid} berhasil diubah menjadi {new_nice}.")
+                self.load_processes()
+            except Exception as exc:
+                self.show_error("Gagal mengubah prioritas", exc)
 
     def refresh_devices(self):
         try:
-            result = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10)
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "ADB gagal.")
-            devices = []
-            unauthorized = []
-            for line in result.stdout.splitlines()[1:]:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    if parts[1] == "device":
-                        devices.append(parts[0])
-                    elif parts[1] == "unauthorized":
-                        unauthorized.append(parts[0])
+            devices, unauthorized = get_adb_devices()
             self.device_combo["values"] = devices
             if devices:
                 self.device.set(devices[0])
@@ -555,43 +154,25 @@ class RemoteControlApp:
             return
 
         try:
-            model = self.run_adb(
-                ["shell", "getprop", "ro.product.model"], timeout=8
-            )
-            android = self.run_adb(
-                ["shell", "getprop", "ro.build.version.release"], timeout=8
-            )
-            battery_output = self.run_adb(
-                ["shell", "dumpsys", "battery"], timeout=8
-            )
+            model = self.run_adb_local(["shell", "getprop", "ro.product.model"], timeout=8)
+            android = self.run_adb_local(["shell", "getprop", "ro.build.version.release"], timeout=8)
+            battery_output = self.run_adb_local(["shell", "dumpsys", "battery"], timeout=8)
             battery_level = next(
-                (
-                    line.split(":", 1)[1].strip()
-                    for line in battery_output.splitlines()
-                    if line.strip().startswith("level:")
-                ),
-                None,
+                (line.split(":", 1)[1].strip() for line in battery_output.splitlines() if line.strip().startswith("level:")),
+                None
             )
-
-            storage_output = self.run_adb(
-                ["shell", "df", "-h", "/data"], timeout=8
-            )
+            storage_output = self.run_adb_local(["shell", "df", "-h", "/data"], timeout=8)
             storage_lines = storage_output.splitlines()
             storage = "Tidak tersedia"
             if len(storage_lines) >= 2:
                 columns = storage_lines[-1].split()
                 if len(columns) >= 5:
-                    storage = (
-                        f"Terpakai {columns[2]} dari {columns[1]} "
-                        f"({columns[4]})"
-                    )
+                    storage = f"Terpakai {columns[2]} dari {columns[1]} ({columns[4]})"
 
             self.dashboard_connection.set("Terhubung melalui ADB")
             self.dashboard_model.set(model or "Tidak diketahui")
             self.dashboard_android.set(android or "Tidak diketahui")
-            self.dashboard_battery.set(
-                f"{battery_level}%" if battery_level else "Tidak tersedia"
-            )
+            self.dashboard_battery.set(f"{battery_level}%" if battery_level else "Tidak tersedia")
             self.dashboard_storage.set(storage)
         except Exception as exc:
             self.dashboard_connection.set("Gagal membaca perangkat")
@@ -607,8 +188,8 @@ class RemoteControlApp:
 
     def device_info(self):
         try:
-            model = self.run_adb(["shell", "getprop", "ro.product.model"])
-            android = self.run_adb(["shell", "getprop", "ro.build.version.release"])
+            model = self.run_adb_local(["shell", "getprop", "ro.product.model"])
+            android = self.run_adb_local(["shell", "getprop", "ro.build.version.release"])
             serial = self.device.get()
             messagebox.showinfo("Info perangkat", f"Model: {model}\nAndroid: {android}\nADB ID: {serial}", parent=self.root)
         except Exception as exc:
@@ -618,11 +199,7 @@ class RemoteControlApp:
         self._start_scrcpy(screen_off=False)
 
     def start_mirroring_screen_off(self):
-        if not messagebox.askyesno(
-            "Konfirmasi",
-            "Coba matikan layar fisik HP saat mirroring berjalan? Ini bergantung pada dukungan scrcpy/Android.",
-            parent=self.root
-        ):
+        if not messagebox.askyesno("Konfirmasi", "Coba matikan layar fisik HP saat mirroring berjalan?", parent=self.root):
             return
         self._start_scrcpy(screen_off=True)
 
@@ -643,21 +220,21 @@ class RemoteControlApp:
 
     def lock_screen(self):
         try:
-            self.run_adb(["shell", "input", "keyevent", "26"])
+            self.run_adb_local(["shell", "input", "keyevent", "26"])
             self.status.set("Perintah tombol daya dikirim.")
         except Exception as exc:
             self.show_error("Gagal mengunci layar", exc)
 
     def wake_screen(self):
         try:
-            self.run_adb(["shell", "input", "keyevent", "224"])
+            self.run_adb_local(["shell", "input", "keyevent", "224"])
             self.status.set("Perintah bangunkan layar dikirim.")
         except Exception as exc:
             self.show_error("Gagal membangunkan layar", exc)
 
     def load_packages(self):
         try:
-            output = self.run_adb(["shell", "pm", "list", "packages", "-3"], timeout=30)
+            output = self.run_adb_local(["shell", "pm", "list", "packages", "-3"], timeout=30)
             self.packages = sorted(
                 line.replace("package:", "", 1).strip()
                 for line in output.splitlines()
@@ -676,15 +253,11 @@ class RemoteControlApp:
             messagebox.showinfo("Pilih aplikasi", "Pilih satu atau beberapa aplikasi dari daftar.", parent=self.root)
             return
         selected = [self.package_list.get(index) for index in selection]
-        if not messagebox.askyesno(
-            "Konfirmasi force stop",
-            "Hentikan aplikasi berikut?\n\n" + "\n".join(selected),
-            parent=self.root
-        ):
+        if not messagebox.askyesno("Konfirmasi force stop", "Hentikan aplikasi berikut?\n\n" + "\n".join(selected), parent=self.root):
             return
         try:
             for package in selected:
-                self.run_adb(["shell", "am", "force-stop", package], timeout=20)
+                self.run_adb_local(["shell", "am", "force-stop", package], timeout=20)
             self.status.set(f"{len(selected)} aplikasi dihentikan.")
             messagebox.showinfo("Selesai", "Perintah force-stop berhasil dikirim.", parent=self.root)
         except Exception as exc:
@@ -696,7 +269,7 @@ class RemoteControlApp:
             return
         try:
             name = os.path.basename(path)
-            self.run_adb(["push", path, f"/sdcard/Download/{name}"], timeout=180)
+            self.run_adb_local(["push", path, f"/sdcard/Download/{name}"], timeout=180)
             self.status.set(f"File dikirim: {name}")
             messagebox.showinfo("Transfer selesai", f"File dikirim ke Download/{name} pada HP.", parent=self.root)
         except Exception as exc:
@@ -715,7 +288,7 @@ class RemoteControlApp:
         if not messagebox.askyesno("Konfirmasi instalasi", f"Instal APK ini pada HP?\n\n{path}", parent=self.root):
             return
         try:
-            output = self.run_adb(["install", "-r", path], timeout=240)
+            output = self.run_adb_local(["install", "-r", path], timeout=240)
             self.status.set(output or "Perintah instalasi selesai.")
             messagebox.showinfo("Instalasi selesai", output or "ADB menyelesaikan instalasi.", parent=self.root)
         except Exception as exc:
@@ -753,83 +326,220 @@ class RemoteControlApp:
         self.timer_label.configure(text=f"{remaining // 60:02d}:{remaining % 60:02d}")
         if remaining <= 0:
             self.stop_timer()
-            if messagebox.askyesno(
-                "Batas waktu tercapai",
-                "Batas sesi tercapai. Kirim perintah tombol daya ke HP untuk mengunci/mematikan layar?",
-                parent=self.root
-            ):
+            if messagebox.askyesno("Batas waktu tercapai", "Batas sesi tercapai. Kunci layar HP?", parent=self.root):
                 self.lock_screen()
             return
         self.timer_job = self.root.after(1000, self._tick_timer)
 
-    def load_processes(self):
-        """Mengambil daftar proses aktif dan penggunaan CPU (%) dari Android via ADB."""
-        try:
-            # Menggunakan perintah top -n 1 (snapshot 1 iterasi) untuk mendapatkan beban CPU per proses
-            output = self.run_adb(["shell", "top", "-n", "1", "-b"], timeout=15)
+    def _build_ui(self):
+        self.root.configure(bg="#F3F6FC")
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", rowheight=35)
 
-            for item in self.proc_tree.get_children():
-                self.proc_tree.delete(item)
+        BG, CARD, NAVY, BLUE, TEXT, MUTED, BORDER = "#F3F6FC", "#FFFFFF", "#17243A", "#356DF3", "#243149", "#68758B", "#DCE4F0"
 
-            lines = output.splitlines()
-            data_started = False
+        style.configure(".", font=("DejaVu Sans", 10))
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure("Header.TLabel", background=BG, foreground=NAVY, font=("DejaVu Sans", 21, "bold"))
+        style.configure("Subtitle.TLabel", background=BG, foreground=MUTED, font=("DejaVu Sans", 9))
+        style.configure("TLabelframe", background=CARD, bordercolor=BORDER, relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=CARD, foreground=NAVY, font=("DejaVu Sans", 10, "bold"))
+        style.configure("TButton", background=CARD, foreground=TEXT, bordercolor=BORDER, padding=(13, 8), relief="flat", font=("DejaVu Sans", 9, "bold"))
+        style.map("TButton", background=[("active", "#E8EEFF"), ("pressed", "#D8E3FF")], foreground=[("disabled", "#9AA5B5")])
+        style.configure("Accent.TButton", background=BLUE, foreground="#FFFFFF", bordercolor=BLUE, padding=(14, 9))
+        style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(2, 5, 2, 0))
+        style.configure("TNotebook.Tab", background="#E8EDF6", foreground=MUTED, padding=(15, 10), font=("DejaVu Sans", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", CARD), ("active", "#DCE6FA")], foreground=[("selected", BLUE), ("active", NAVY)])
 
-            for line in lines:
-                # Deteksi baris header dari perintah top Android
-                if "PID" in line and ("CPU" in line or "COMMAND" in line or "NAME" in line):
-                    data_started = True
-                    continue
+        header = ttk.Frame(self.root, padding=12)
+        header.pack(fill="x")
+        ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(anchor="w")
+        ttk.Label(header, text="USB + ADB • Gunakan hanya pada perangkat milikmu atau yang kamu punya izin untuk kelola.", wraplength=940, style="Subtitle.TLabel").pack(anchor="w", pady=(4, 8))
 
-                if data_started and line.strip():
-                    parts = line.split(None, 9)
-                    if len(parts) >= 9:
-                        pid = parts[0]
-                        status = parts[3]
-                        cpu_pct = parts[2] + "%"  # Nilai persentase penggunaan CPU
-                        name = parts[8] if len(parts) > 8 else "Unknown"
-                        user = "system"
-                        nice = "0"
+        device_frame = ttk.LabelFrame(self.root, text="Perangkat Android", padding=10)
+        device_frame.pack(fill="x", padx=12, pady=4)
+        ttk.Label(device_frame, text="Device ID:").pack(side="left")
+        self.device_combo = ttk.Combobox(device_frame, textvariable=self.device, state="readonly", width=32)
+        self.device_combo.pack(side="left", padx=8)
+        ttk.Button(device_frame, text="Refresh", command=self.refresh_devices).pack(side="left")
+        ttk.Button(device_frame, text="Info perangkat", command=self.device_info).pack(side="left", padx=6)
+        ttk.Label(device_frame, textvariable=self.status, wraplength=450).pack(side="left", padx=12, fill="x", expand=True)
 
-                        self.proc_tree.insert("", "end", values=(pid, user, status, nice, cpu_pct, name))
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=12, pady=8)
 
-            self.status.set("Berhasil memuat daftar proses dan penggunaan CPU perangkat.")
-        except Exception as exc:
-            # Fallback otomatis ke ps jika top mengalami kendala di versi Android tertentu
-            try:
-                output = self.run_adb(["shell", "ps", "-eo", "PID,USER,S,NI,NAME"], timeout=10)
-                for item in self.proc_tree.get_children():
-                    self.proc_tree.delete(item)
-                for line in output.splitlines()[1:]:
-                    parts = line.split(None, 4)
-                    if len(parts) >= 5:
-                        pid, user, status, nice, name = parts
-                        self.proc_tree.insert("", "end", values=(pid, user, status, nice, "N/A", name))
-                self.status.set("Memuat proses via ps (fallback mode).")
-            except Exception as inner_exc:
-                self.show_error("Gagal memuat proses", inner_exc)
+        dashboard_tab = ttk.Frame(notebook, padding=16)
+        mirror_tab = ttk.Frame(notebook, padding=12)
+        apps_tab = ttk.Frame(notebook, padding=12)
+        files_tab = ttk.Frame(notebook, padding=12)
+        usage_tab = ttk.Frame(notebook, padding=12)
 
-    def change_process_priority(self):
-        """Mengubah nilai nice suatu proses untuk simulasi penjadwalan CPU."""
-        selected_item = self.proc_tree.selection()
-        if not selected_item:
-            messagebox.showinfo("Pilih Proses", "Pilih salah satu baris proses dari tabel terlebih dahulu.", parent=self.root)
-            return
+        notebook.add(dashboard_tab, text="Dashboard")
+        notebook.add(mirror_tab, text="Mirroring & Kontrol")
+        notebook.add(apps_tab, text="Aplikasi")
 
-        item_data = self.proc_tree.item(selected_item[0])['values']
-        pid = item_data[0]
-        name = item_data[4]
+        # Tab Memori
+        mem_tab = ttk.Frame(notebook)
+        notebook.add(mem_tab, text="Manajemen Memori")
+        mem_top = ttk.Frame(mem_tab, padding=10)
+        mem_top.pack(fill="x")
+        ttk.Label(mem_top, text="Inspeksi Alokasi Memori Fisik & Swapping (Virtual Memory)", font=("Arial", 11, "bold")).pack(anchor="w")
+        ttk.Label(mem_top, text="Menganalisis penggunaan RAM, ruang swap, dan cache berdasarkan struktur kernel /proc/meminfo.").pack(anchor="w", pady=(0, 10))
+        ttk.Button(mem_top, text="Muat Informasi Memori", command=self.load_memory_info).pack(anchor="w")
 
-        new_nice = tk.simpledialog.askinteger("Ubah Prioritas (Nice)", f"PID {pid} ({name}):\nMasukkan nilai Nice (-20 sampai 19):", minvalue=-20, maxvalue=19, parent=self.root)
-        if new_nice is not None:
-            try:
-                self.run_adb(["shell", "renice", str(new_nice), str(pid)], timeout=10)
-                self.status.set(f"Prioritas PID {pid} berhasil diubah menjadi {new_nice}.")
-                self.load_processes()
-            except Exception as exc:
-                self.show_error("Gagal mengubah prioritas", exc)
+        mem_frame = ttk.Frame(mem_tab, padding=10)
+        mem_frame.pack(fill="both", expand=True)
+        mem_columns = ("Parameter", "Nilai (Value)", "Keterangan Konsep OS")
+        self.mem_tree = ttk.Treeview(mem_frame, columns=mem_columns, show="headings", height=12)
+        self.mem_tree.heading("Parameter", text="Parameter Memori")
+        self.mem_tree.heading("Nilai (Value)", text="Nilai (Value)")
+        self.mem_tree.heading("Keterangan Konsep OS", text="Keterangan Konsep OS")
+        self.mem_tree.column("Parameter", width=200, anchor="w", stretch=False)
+        self.mem_tree.column("Nilai (Value)", width=150, anchor="w", stretch=False)
+        self.mem_tree.column("Keterangan Konsep OS", width=500, anchor="w", stretch=True)
+        mem_scroll = ttk.Scrollbar(mem_frame, orient="vertical", command=self.mem_tree.yview)
+        self.mem_tree.configure(yscrollcommand=mem_scroll.set)
+        self.mem_tree.pack(side="left", fill="both", expand=True)
+        mem_scroll.pack(side="right", fill="y")
+
+        # Tab Sinkronisasi
+        sync_tab = ttk.Frame(notebook)
+        notebook.add(sync_tab, text="Sinkronisasi OS")
+        sync_top = ttk.Frame(sync_tab, padding=10)
+        sync_top.pack(fill="x")
+        ttk.Label(sync_top, text="Simulasi Antrean Proses (Queue) & Proteksi Mutex Lock", font=("Arial", 11, "bold")).pack(anchor="w")
+        ttk.Label(sync_top, text="Mengatur eksekusi perintah konkuren agar tidak terjadi bentrok sumber daya (race condition).").pack(anchor="w", pady=(0, 10))
+        ttk.Button(sync_top, text="Jalankan Simulasi Antrean Konkuren", command=self.test_concurrency_sync).pack(anchor="w")
+
+        sync_frame = ttk.Frame(sync_tab, padding=10)
+        sync_frame.pack(fill="both", expand=True)
+        sync_scroll = ttk.Scrollbar(sync_frame, orient="vertical")
+        sync_scroll.pack(side="right", fill="y")
+        self.sync_log = tk.Text(sync_frame, wrap="word", bg="#1e1e1e", fg="#00ff00", font=("Courier", 10), yscrollcommand=sync_scroll.set)
+        self.sync_log.pack(side="left", fill="both", expand=True)
+        sync_scroll.config(command=self.sync_log.yview)
+
+        # Dashboard content
+        ttk.Label(dashboard_tab, text="Ringkasan Perangkat", font=("TkDefaultFont", 16, "bold")).pack(anchor="w", pady=(0, 12))
+        self.dashboard_connection = tk.StringVar(value="Memeriksa koneksi...")
+        self.dashboard_model = tk.StringVar(value="-")
+        self.dashboard_android = tk.StringVar(value="-")
+        self.dashboard_battery = tk.StringVar(value="-")
+        self.dashboard_storage = tk.StringVar(value="-")
+
+        info_frame = ttk.LabelFrame(dashboard_tab, text="Informasi HP", padding=12)
+        info_frame.pack(fill="x", pady=4)
+
+        for label, variable in [
+            ("Status koneksi", self.dashboard_connection),
+            ("Model perangkat", self.dashboard_model),
+            ("Versi Android", self.dashboard_android),
+            ("Baterai", self.dashboard_battery),
+            ("Penyimpanan /data", self.dashboard_storage),
+        ]:
+            line = ttk.Frame(info_frame)
+            line.pack(fill="x", pady=5)
+            ttk.Label(line, text=label, width=22).pack(side="left")
+            ttk.Label(line, textvariable=variable, font=("TkDefaultFont", 10, "bold")).pack(side="left", fill="x", expand=True)
+
+        dashboard_buttons = ttk.Frame(dashboard_tab)
+        dashboard_buttons.pack(fill="x", pady=12)
+        ttk.Button(dashboard_buttons, text="Perbarui informasi", command=self.refresh_dashboard).pack(side="left")
+        ttk.Button(dashboard_buttons, text="Refresh perangkat", command=self.refresh_devices).pack(side="left", padx=8)
+
+        # Tab Manajemen Proses
+        process_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(process_tab, text="Manajemen Proses & CPU")
+        ttk.Label(process_tab, text="Daftar Proses Android & Penjadwalan (Process Table)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        ttk.Label(process_tab, text="Menampilkan PID, Status, Prioritas (Nice), dan CPU Usage (%) dari kernel Android.").pack(anchor="w", pady=4)
+
+        proc_top = ttk.Frame(process_tab)
+        proc_top.pack(fill="x", pady=6)
+        ttk.Button(proc_top, text="Muat Proses (PS)", command=self.load_processes).pack(side="left")
+        ttk.Button(proc_top, text="Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
+
+        tree_frame = ttk.Frame(process_tab)
+        tree_frame.pack(fill="both", expand=True, pady=4)
+
+        self.proc_tree = ttk.Treeview(
+            tree_frame, 
+            columns=("PID", "USER", "STATUS", "NICE", "CPU (%)", "Command / Nama Proses"),
+            show="headings",
+            height=30
+        )
+        self.proc_tree.heading("PID", text="PID")
+        self.proc_tree.heading("USER", text="User")
+        self.proc_tree.heading("STATUS", text="Status")
+        self.proc_tree.heading("NICE", text="Nice (NI)")
+        self.proc_tree.heading("CPU (%)", text="CPU (%)")
+        self.proc_tree.heading("Command / Nama Proses", text="Command / Nama Proses")
+
+        self.proc_tree.column("PID", width=80, anchor="center", stretch=False)
+        self.proc_tree.column("USER", width=100, anchor="center", stretch=False)
+        self.proc_tree.column("STATUS", width=80, anchor="center", stretch=False)
+        self.proc_tree.column("NICE", width=80, anchor="center", stretch=False)
+        self.proc_tree.column("CPU (%)", width=80, anchor="center", stretch=False)
+        self.proc_tree.column("Command / Nama Proses", width=500, anchor="w", stretch=True)
+
+        proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
+        self.proc_tree.configure(yscrollcommand=proc_scroll.set)
+        self.proc_tree.pack(side="left", fill="both", expand=True)
+        proc_scroll.pack(side="right", fill="y")
+
+        notebook.add(files_tab, text="Transfer File")
+        notebook.add(usage_tab, text="Screen Time")
+
+        # Mirroring tab
+        ttk.Label(mirror_tab, text="Mirroring menggunakan scrcpy", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        ttk.Label(mirror_tab, text="scrcpy membuka jendela layar HP terpisah dan meneruskan klik, scroll, serta ketikan keyboard.").pack(anchor="w", pady=6)
+        row = ttk.Frame(mirror_tab)
+        row.pack(anchor="w", pady=8)
+        ttk.Button(row, text="Mulai mirroring", command=self.start_mirroring).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Mirroring + layar HP mati", command=self.start_mirroring_screen_off).pack(side="left", padx=8)
+        ttk.Button(row, text="Kunci layar HP", command=self.lock_screen).pack(side="left", padx=8)
+        ttk.Button(row, text="Bangunkan layar", command=self.wake_screen).pack(side="left", padx=8)
+
+        # Apps tab
+        app_top = ttk.Frame(apps_tab)
+        app_top.pack(fill="x")
+        ttk.Label(app_top, text="Daftar aplikasi pihak ketiga pada HP:").pack(side="left")
+        ttk.Button(app_top, text="Muat daftar", command=self.load_packages).pack(side="left", padx=8)
+        ttk.Button(app_top, text="Force stop terpilih", command=self.force_stop_selected).pack(side="left", padx=4)
+        list_frame = ttk.Frame(apps_tab)
+        list_frame.pack(fill="both", expand=True, pady=4)
+        self.package_list = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=18, font=("DejaVu Sans Mono", 10))
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.package_list.yview)
+        self.package_list.configure(yscrollcommand=scrollbar.set)
+        self.package_list.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Files tab
+        ttk.Label(files_tab, text="Kirim file dari laptop ke folder Download HP.").pack(anchor="w")
+        ttk.Button(files_tab, text="Pilih file lalu kirim ke HP", command=self.push_file).pack(anchor="w", pady=8)
+        ttk.Label(files_tab, text="Pilih APK untuk memasangnya pada HP yang terhubung.").pack(anchor="w", pady=(16, 0))
+        ttk.Button(files_tab, text="Pilih APK lalu instal", command=self.install_apk).pack(anchor="w", pady=8)
+
+        # Usage tab
+        ttk.Label(usage_tab, text="Timer sesi pemantauan", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        time_row = ttk.Frame(usage_tab)
+        time_row.pack(anchor="w", pady=8)
+        ttk.Label(time_row, text="Batas sesi (menit):").pack(side="left")
+        ttk.Entry(time_row, textvariable=self.minutes, width=8).pack(side="left", padx=8)
+        ttk.Button(time_row, text="Mulai timer", command=self.start_timer).pack(side="left", padx=4)
+        ttk.Button(time_row, text="Hentikan timer", command=self.stop_timer).pack(side="left", padx=4)
+        self.timer_label = ttk.Label(usage_tab, text="00:00", font=("TkDefaultFont", 24, "bold"))
+        self.timer_label.pack(anchor="w", pady=12)
+
+        footer = ttk.Frame(self.root, padding=(12, 0, 12, 12))
+        footer.pack(fill="x")
+        ttk.Separator(footer).pack(fill="x", pady=(0, 8))
+        ttk.Label(footer, text="Status: ADB hanya berfungsi setelah otorisasi USB Debugging disetujui pada HP.").pack(anchor="w")
 
     def on_close(self):
         self.stop_timer()
+        self.os_handler.is_worker_running = False
         self.root.destroy()
 
 
