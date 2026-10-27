@@ -3,9 +3,9 @@
 
 import os
 import subprocess
-import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 from adb_helper import run_adb_cmd, get_adb_devices
@@ -13,28 +13,39 @@ from os_features import OSFeaturesHandler
 
 APP_TITLE = "Android Remote Control Center"
 
+PIN_LOCK = "12345678"
+
 
 class RemoteControlApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1000x720")
-        self.root.minsize(820, 600)
+        self.root.geometry("1050x780")
+        self.root.minsize(850, 640)
 
-        # Inisialisasi Modul OS Features
         self.os_handler = OSFeaturesHandler(self.run_adb)
-        self.worker_thread = threading.Thread(
-            target=self.os_handler.queue_worker, args=(self.root,), daemon=True
-        )
-        self.worker_thread.start()
-
         self.device = tk.StringVar()
         self.status = tk.StringVar(value="Sambungkan HP melalui USB, aktifkan USB Debugging, lalu Refresh.")
         self.minutes = tk.StringVar(value="30")
         self.timer_running = False
         self.timer_start = None
         self.timer_job = None
+        self.session_locked = False
         self.packages = []
+        self.recording_process = None
+
+        self.dashboard_connection = tk.StringVar(value="Memeriksa koneksi...")
+        self.dashboard_device_name = tk.StringVar(value="-")
+        self.dashboard_model = tk.StringVar(value="-")
+        self.dashboard_ram = tk.StringVar(value="-")
+        self.dashboard_cpu = tk.StringVar(value="-")
+        self.dashboard_os = tk.StringVar(value="-")
+        self.dashboard_android = tk.StringVar(value="-")
+        self.dashboard_security = tk.StringVar(value="-")
+        self.dashboard_baseband = tk.StringVar(value="-")
+        self.dashboard_kernel = tk.StringVar(value="-")
+        self.dashboard_battery = tk.StringVar(value="-")
+        self.dashboard_storage = tk.StringVar(value="-")
 
         self._build_ui()
         self.refresh_devices()
@@ -42,12 +53,9 @@ class RemoteControlApp:
         self.refresh_dashboard_loop()
 
     def run_adb(self, device_id, *, args, timeout=15):
-        """Menjembatani pemanggilan ADB dari modul OS ke modul pembantu."""
-        # Modul OS memanggil dengan device_id sebagai argumen pertama
         return run_adb_cmd(device_id, args=args, timeout=timeout)
 
     def run_adb_local(self, args, timeout=15):
-        """Fungsi pembantu lokal untuk perintah ADB yang menggunakan perangkat terpilih."""
         device_id = self.device.get().strip()
         return run_adb_cmd(device_id, args=args, timeout=timeout)
 
@@ -55,56 +63,203 @@ class RemoteControlApp:
         self.status.set(str(error))
         messagebox.showerror(title, str(error), parent=self.root)
 
-    def submit_to_queue(self, func, args=(), callback=None):
-        self.os_handler.submit_to_queue(func, args, callback)
-        self.status.set(f"Tugas dimasukkan ke antrean (Total pending: {self.os_handler.cmd_queue.qsize()})")
+    def load_memory_details_for_selected(self):
+        """Mengambil data memori Pure APK, Data, dan Cache secara akurat dari sistem HP."""
+        selected_item = self.mem_tree.selection()
+        if not selected_item:
+            messagebox.showinfo("Pilih Aplikasi", "Pilih salah satu aplikasi dari tabel terlebih dahulu.", parent=self.root)
+            return
+        
+        item_data = self.mem_tree.item(selected_item[0])['values']
+        app_name = item_data[0]
+        pkg_name = item_data[1]
+        
+        self.status.set(f"Mengambil data memori HP untuk {app_name}...")
+        self.root.update()
 
-    def test_concurrency_sync(self):
-        def dummy_adb_task(task_id):
-            time.sleep(1)
-            return f"Task #{task_id} berhasil dieksekusi dengan aman melalui Proteksi Mutex Lock."
-
-        def on_task_finished(success, res):
-            if hasattr(self, 'sync_log'):
-                self.sync_log.insert(tk.END, f"[SYNC/MUTEX] {res}\n")
-                self.sync_log.see(tk.END)
-
-        for i in range(1, 4):
-            self.submit_to_queue(dummy_adb_task, args=(i,), callback=on_task_finished)
-
-    def load_memory_info(self):
         try:
-            device_id = self.device.get().strip()
-            memory_data = self.os_handler.get_memory_info(device_id)
+            # 1. Ambil path file APK untuk menghitung ukuran file instalasi (Code Size)
+            apk_path_out = self.run_adb_local(["shell", "pm", "path", pkg_name], timeout=8)
+            code_size_str = "Tidak diketahui"
+            
+            for line in apk_path_out.splitlines():
+                if line.startswith("package:"):
+                    apk_file = line.replace("package:", "").strip()
+                    size_res = self.run_adb_local(["shell", "stat", "-c", "%s", apk_file], timeout=6)
+                    if size_res.strip().isdigit():
+                        b = int(size_res.strip())
+                        code_size_str = f"{b / (1024*1024):.2f} MB ({b:,} bytes)"
+                        break
+
+            # 2. Ambil data ukuran dari dumpsys package untuk Data & Cache
+            pkg_output = self.run_adb_local(["shell", "dumpsys", "package", pkg_name], timeout=10)
+            data_size = "Tidak diketahui"
+            cache_size = "Tidak diketahui"
+            
+            for line in pkg_output.splitlines():
+                line_str = line.strip()
+                if "dataSize=" in line_str:
+                    data_size = line_str.split("dataSize=")[1].split()[0]
+                elif "cacheSize=" in line_str:
+                    cache_size = line_str.split("cacheSize=")[1].split()[0]
+
+            def format_bytes(b_str):
+                try:
+                    b = int(b_str)
+                    if b > 1024 * 1024 * 1024:
+                        return f"{b / (1024*1024*1024):.2f} GB ({b:,} bytes)"
+                    elif b > 1024 * 1024:
+                        return f"{b / (1024*1024):.2f} MB ({b:,} bytes)"
+                    elif b > 1024:
+                        return f"{b / 1024:.2f} KB ({b:,} bytes)"
+                    return f"{b} bytes"
+                except Exception:
+                    return b_str
+
+            # 3. Ambil penggunaan RAM aktif (PSS)
+            mem_output = self.run_adb_local(["shell", "dumpsys", "meminfo", pkg_name], timeout=10)
+
+            detail_text = f"===========================================================\n"
+            detail_text += f" ANALISIS MEMORI HP: {app_name}\n"
+            detail_text += f" Package: {pkg_name}\n"
+            detail_text += f"===========================================================\n\n"
+            
+            detail_text += f"📦 1. DATA PURE APK (Ukuran Install Asli):\n"
+            detail_text += f"   • Code Size (APK): {code_size_str}\n\n"
+            
+            detail_text += f"📊 2. DATA SETELAH PEMAKAIAN (User Data & Cache):\n"
+            detail_text += f"   • Data Size: {format_bytes(data_size)}\n"
+            detail_text += f"   • Cache Size: {format_bytes(cache_size)}\n\n"
+            
+            detail_text += f"🧠 3. PENGGUNAAN RAM AKTIF (PSS):\n"
+            
+            ram_lines_found = False
+            for line in mem_output.splitlines():
+                if "TOTAL" in line or "RAM" in line or "PSS" in line or "Native Heap" in line or "Dalvik Heap" in line:
+                    detail_text += f"   {line.strip()}\n"
+                    ram_lines_found = True
+
+            if not ram_lines_found:
+                detail_text += f"   (Aplikasi sedang tidak aktif berjalan di latar belakang)\n"
+
+            self.mem_detail_box.delete("1.0", tk.END)
+            self.mem_detail_box.insert(tk.END, detail_text)
+            self.status.set(f"Berhasil memuat data memori HP untuk {app_name}.")
+        except Exception as exc:
+            self.show_error("Gagal Memuat Memori HP", exc)
+
+    def load_memory_packages_list(self):
+        """Memuat daftar aplikasi pihak ketiga dengan label nama asli, diurutkan abjad."""
+        try:
+            self.status.set("Memuat daftar aplikasi dari HP...")
+            self.root.update()
+
+            output = self.run_adb_local(["shell", "pm", "list", "packages", "-3"], timeout=30)
+            packages = [line.replace("package:", "").strip() for line in output.splitlines() if line.startswith("package:")]
+            
+            app_list = []
+            for pkg in packages:
+                app_name = "Tidak diketahui"
+                try:
+                    pkg_info = self.run_adb_local(["shell", "dumpsys", "package", pkg], timeout=4)
+                    for line in pkg_info.splitlines():
+                        if "applicationInfo" in line and "label=" in line:
+                            parts = line.split("label=")
+                            if len(parts) > 1:
+                                app_name = parts[1].split()[0].strip("'\"")
+                                break
+                except Exception:
+                    pass
+
+                if app_name == "Tidak diketahui" or not app_name:
+                    app_name = pkg.split('.')[-1].capitalize()
+
+                app_list.append((app_name, pkg))
+
+            app_list.sort(key=lambda x: x[0].lower())
 
             for item in self.mem_tree.get_children():
                 self.mem_tree.delete(item)
 
-            target_keys = [
-                "MemTotal", "MemFree", "MemAvailable", "Buffers",
-                "Cached", "SwapTotal", "SwapFree", "VmallocTotal", "VmallocUsed"
-            ]
+            for app_name, pkg in app_list:
+                self.mem_tree.insert("", "end", values=(app_name, pkg))
 
-            for key in target_keys:
-                if key in memory_data:
-                    desc = self.os_handler.get_memory_description(key)
-                    self.mem_tree.insert("", "end", values=(key, memory_data[key], desc))
-
-            self.status.set("Berhasil memuat data manajemen memori dan swapping Android.")
+            self.status.set(f"Berhasil memuat {len(app_list)} aplikasi dari HP.")
         except Exception as exc:
-            self.show_error("Gagal memuat info memori", exc)
+            self.show_error("Gagal memuat aplikasi", exc)
+
+    def load_screen_time_by_period(self, period):
+        """Mengambil data screen time secara real-time menggunakan dumpsys usagestats."""
+        try:
+            device_id = self.device.get().strip()
+            if not device_id:
+                messagebox.showwarning("Perangkat Belum Dipilih", "Pilih perangkat HP terlebih dahulu.", parent=self.root)
+                return
+
+            self.status.set(f"Menganalisis penggunaan aplikasi real-time ({period})...")
+            self.root.update()
+
+            raw_output = self.run_adb_local(["shell", "dumpsys", "usagestats"], timeout=15)
+            self.st_text.delete("1.0", tk.END)
+            
+            app_stats = {}
+            current_pkg = None
+            
+            for line in raw_output.splitlines():
+                line_str = line.strip()
+                if "package=" in line_str:
+                    try:
+                        part = line_str.split("package=")[1]
+                        current_pkg = part.split()[0].rstrip("}")
+                    except Exception:
+                        pass
+                
+                if "totalTimeInForeground=" in line_str and current_pkg:
+                    try:
+                        val_str = line_str.split("totalTimeInForeground=")[1].split()[0]
+                        time_val = int(val_str)
+                        if time_val > 0:
+                            app_stats[current_pkg] = app_stats.get(current_pkg, 0) + time_val
+                    except Exception:
+                        pass
+
+            total_ms = sum(app_stats.values())
+            total_mins = total_ms // 60000
+            total_hrs = total_mins // 60
+            total_rem_mins = total_mins % 60
+            total_str = f"{total_hrs} j, {total_rem_mins} mnt" if total_hrs > 0 else f"{total_mins} mnt"
+            
+            self.st_text.insert(tk.END, f"===========================================================\n")
+            self.st_text.insert(tk.END, f"         DETAIL AKTIVITAS APLIKASI (REAL-TIME)             \n")
+            self.st_text.insert(tk.END, f"===========================================================\n\n")
+            self.st_text.insert(tk.END, f"               Waktu pemakaian perangkat                   \n")
+            self.st_text.insert(tk.END, f"                      {total_str}                         \n")
+            self.st_text.insert(tk.END, f"                       {period.capitalize()}               \n\n")
+
+            if app_stats:
+                sorted_apps = sorted(app_stats.items(), key=lambda x: x[1], reverse=True)[:15]
+                for pkg, ms in sorted_apps:
+                    minutes_val = ms // 60000
+                    hours_val = minutes_val // 60
+                    rem_mins = minutes_val % 60
+                    dur_str = f"{hours_val} j, {rem_mins} mnt" if hours_val > 0 else f"{minutes_val} mnt"
+                    
+                    self.st_text.insert(tk.END, f" 📱 Package: {pkg}\n    ⌛ Waktu Aktif: {dur_str}\n\n")
+            else:
+                self.st_text.insert(tk.END, "⚠️ Tidak ada data foreground time yang terekam pada periode ini.\n")
+
+            self.status.set(f"Berhasil memuat screen time real-time ({period}).")
+        except Exception as exc:
+            self.show_error(f"Gagal memuat screen time {period}", exc)
 
     def load_processes(self):
         try:
             device_id = self.device.get().strip()
             processes = self.os_handler.get_process_table(device_id)
-
             for item in self.proc_tree.get_children():
                 self.proc_tree.delete(item)
-
             for proc in processes:
                 self.proc_tree.insert("", "end", values=proc)
-
             self.status.set("Berhasil memuat daftar proses dan penggunaan CPU perangkat.")
         except Exception as exc:
             self.show_error("Gagal memuat proses", exc)
@@ -147,39 +302,72 @@ class RemoteControlApp:
     def refresh_dashboard(self):
         if not self.device.get().strip():
             self.dashboard_connection.set("Tidak terhubung")
+            self.dashboard_device_name.set("-")
             self.dashboard_model.set("-")
+            self.dashboard_ram.set("-")
+            self.dashboard_cpu.set("-")
+            self.dashboard_os.set("-")
             self.dashboard_android.set("-")
+            self.dashboard_security.set("-")
+            self.dashboard_baseband.set("-")
+            self.dashboard_kernel.set("-")
             self.dashboard_battery.set("-")
             self.dashboard_storage.set("-")
             return
 
         try:
-            model = self.run_adb_local(["shell", "getprop", "ro.product.model"], timeout=8)
-            android = self.run_adb_local(["shell", "getprop", "ro.build.version.release"], timeout=8)
-            battery_output = self.run_adb_local(["shell", "dumpsys", "battery"], timeout=8)
+            device_name = self.run_adb_local(["shell", "getprop", "ro.product.model"], timeout=6)
+            model = self.run_adb_local(["shell", "getprop", "ro.product.device"], timeout=6)
+            os_version = self.run_adb_local(["shell", "getprop", "ro.miui.ui.version.name"], timeout=6) or \
+                         self.run_adb_local(["shell", "getprop", "ro.build.display.id"], timeout=6)
+            android_ver = self.run_adb_local(["shell", "getprop", "ro.build.version.release"], timeout=6)
+            security_patch = self.run_adb_local(["shell", "getprop", "ro.build.version.security_patch"], timeout=6)
+            baseband = self.run_adb_local(["shell", "getprop", "gsm.version.baseband"], timeout=6)
+            kernel = self.run_adb_local(["shell", "uname", "-r"], timeout=6)
+            
+            board_platform = self.run_adb_local(["shell", "getprop", "ro.board.platform"], timeout=6)
+            cpu_abi = self.run_adb_local(["shell", "getprop", "ro.product.cpu.abi"], timeout=6)
+            processor_name = f"{board_platform.upper()} ({cpu_abi})" if board_platform else (cpu_abi or "Tidak diketahui")
+
+            mem_info = self.run_adb_local(["shell", "cat", "/proc/meminfo"], timeout=6)
+            total_ram_kb = 0
+            for line in mem_info.splitlines():
+                if "MemTotal" in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        total_ram_kb = int(parts[1])
+                        break
+            ram_gb = f"{total_ram_kb / (1024*1024):.1f} GB" if total_ram_kb > 0 else "Tidak diketahui"
+
+            battery_output = self.run_adb_local(["shell", "dumpsys", "battery"], timeout=6)
             battery_level = next(
                 (line.split(":", 1)[1].strip() for line in battery_output.splitlines() if line.strip().startswith("level:")),
-                None
+                "?"
             )
-            storage_output = self.run_adb_local(["shell", "df", "-h", "/data"], timeout=8)
+
+            storage_output = self.run_adb_local(["shell", "df", "-h", "/data"], timeout=6)
             storage_lines = storage_output.splitlines()
-            storage = "Tidak tersedia"
+            storage_str = "Tidak tersedia"
             if len(storage_lines) >= 2:
                 columns = storage_lines[-1].split()
-                if len(columns) >= 5:
-                    storage = f"Terpakai {columns[2]} dari {columns[1]} ({columns[4]})"
+                if len(columns) >= 4:
+                    storage_str = f"Terpakai {columns[2]} dari {columns[1]} ({columns[4]} terpakai)"
 
             self.dashboard_connection.set("Terhubung melalui ADB")
-            self.dashboard_model.set(model or "Tidak diketahui")
-            self.dashboard_android.set(android or "Tidak diketahui")
-            self.dashboard_battery.set(f"{battery_level}%" if battery_level else "Tidak tersedia")
-            self.dashboard_storage.set(storage)
+            self.dashboard_device_name.set(device_name or "Perangkat Android")
+            self.dashboard_model.set(model or "-")
+            self.dashboard_ram.set(ram_gb)
+            self.dashboard_cpu.set(processor_name)
+            self.dashboard_os.set(os_version or "Android OS")
+            self.dashboard_android.set(android_ver or "-")
+            self.dashboard_security.set(security_patch or "-")
+            self.dashboard_baseband.set(baseband or "-")
+            self.dashboard_kernel.set(kernel or "-")
+            self.dashboard_battery.set(f"{battery_level}%")
+            self.dashboard_storage.set(storage_str)
+
         except Exception as exc:
-            self.dashboard_connection.set("Gagal membaca perangkat")
-            self.dashboard_model.set("-")
-            self.dashboard_android.set("-")
-            self.dashboard_battery.set("-")
-            self.dashboard_storage.set("-")
+            self.dashboard_connection.set("Gagal membaca detail perangkat")
             self.status.set(str(exc))
 
     def refresh_dashboard_loop(self):
@@ -203,6 +391,24 @@ class RemoteControlApp:
             return
         self._start_scrcpy(screen_off=True)
 
+    def start_recording(self):
+        if not self.device.get():
+            messagebox.showwarning("Pilih perangkat", "Pilih HP yang terotorisasi terlebih dahulu.", parent=self.root)
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"record_{timestamp}.mp4"
+        
+        try:
+            args = ["scrcpy", "-s", self.device.get(), "--record", filename]
+            self.recording_process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.status.set(f"Rekaman layar dimulai! File disimpan sebagai {filename}")
+            messagebox.showinfo("Rekam Layar", f"Perekaman layar aktif.\nFile disimpan sebagai:\n{filename}\n\nTutup jendela scrcpy untuk menghentikan rekaman.", parent=self.root)
+        except FileNotFoundError:
+            self.show_error("scrcpy tidak ditemukan", "Pasang scrcpy dengan: sudo apt install scrcpy")
+        except Exception as exc:
+            self.show_error("Gagal memulai rekaman layar", exc)
+
     def _start_scrcpy(self, screen_off):
         if not self.device.get():
             messagebox.showwarning("Pilih perangkat", "Pilih HP yang terotorisasi terlebih dahulu.", parent=self.root)
@@ -221,7 +427,8 @@ class RemoteControlApp:
     def lock_screen(self):
         try:
             self.run_adb_local(["shell", "input", "keyevent", "26"])
-            self.status.set("Perintah tombol daya dikirim.")
+            self.run_adb_local(["shell", "service", "call", "power", "16"])
+            self.status.set("Perintah penguncian total layar dikirim.")
         except Exception as exc:
             self.show_error("Gagal mengunci layar", exc)
 
@@ -232,34 +439,130 @@ class RemoteControlApp:
         except Exception as exc:
             self.show_error("Gagal membangunkan layar", exc)
 
-    def load_packages(self):
+    def start_timer(self):
         try:
+            minutes = int(self.minutes.get())
+            if minutes < 1 or minutes > 1440:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Batas tidak valid", "Masukkan angka 1 sampai 1440 menit.", parent=self.root)
+            return
+        self.stop_timer()
+        self.timer_running = True
+        self.session_locked = False
+        self.timer_start = time.monotonic()
+        self.timer_limit = minutes * 60
+        self._tick_timer()
+        self.status.set(f"Timer sesi dimulai: {minutes} menit. HP akan dikunci total saat habis.")
+
+    def stop_timer(self):
+        self.timer_running = False
+        self.session_locked = False
+        if self.timer_job is not None:
+            try:
+                self.root.after_cancel(self.timer_job)
+            except tk.TclError:
+                pass
+            self.timer_job = None
+        self.timer_label.configure(text="00:00")
+        self.status.set("Timer dihentikan. Sesi dibuka kembali.")
+
+    def unlock_session(self):
+        """Membuka kunci HP dengan memasukkan PIN 12345678 secara otomatis."""
+        self.session_locked = False
+        try:
+            self.wake_screen()
+            time.sleep(0.6)
+            self.run_adb_local(["shell", "input", "swipe", "500", "1500", "500", "500", "300"])
+            time.sleep(0.6)
+            self.run_adb_local(["shell", "input", "text", PIN_LOCK])
+            self.run_adb_local(["shell", "input", "keyevent", "66"])
+            self.status.set("HP berhasil dibuka menggunakan PIN (12345678).")
+            messagebox.showinfo("Akses Diizinkan", "HP telah dibuka kunci menggunakan PIN 12345678 oleh laptop.", parent=self.root)
+        except Exception as exc:
+            self.show_error("Gagal membuka kunci", exc)
+
+    def _tick_timer(self):
+        if not self.timer_running or self.timer_start is None:
+            return
+        elapsed = int(time.monotonic() - self.timer_start)
+        remaining = max(0, self.timer_limit - elapsed)
+        self.timer_label.configure(text=f"{remaining // 60:02d}:{remaining % 60:02d}")
+        
+        if remaining <= 0:
+            self.session_locked = True
+            self.stop_timer()
+            self.timer_label.configure(text="TERKUNCI 🔒")
+            self.lock_screen()
+            messagebox.showwarning("Batas Waktu Habis", "Batas waktu sesi habis!\nHP telah dikunci total. Masukkan PIN (12345678) lewat laptop untuk membuka kembali.", parent=self.root)
+            self._enforce_lock_loop()
+            return
+            
+        self.timer_job = self.root.after(1000, self._tick_timer)
+
+    def _enforce_lock_loop(self):
+        if self.session_locked and self.device.get().strip():
+            try:
+                self.run_adb_local(["shell", "input", "keyevent", "26"], timeout=3)
+                self.status.set("🔒 TERKUNCI: Memerlukan otorisasi laptop (PIN 12345678).")
+            except Exception:
+                pass
+            self.root.after(3000, self._enforce_lock_loop)
+
+    def load_packages(self):
+        """Memuat daftar aplikasi pihak ketiga beserta nama asli (Label) dan diurutkan secara alfabetis."""
+        try:
+            self.status.set("Mengambil daftar aplikasi dan mengurutkan secara alfabetis...")
+            self.root.update()
+
             output = self.run_adb_local(["shell", "pm", "list", "packages", "-3"], timeout=30)
-            self.packages = sorted(
-                line.replace("package:", "", 1).strip()
-                for line in output.splitlines()
-                if line.startswith("package:")
-            )
-            self.package_list.delete(0, tk.END)
-            for package in self.packages:
-                self.package_list.insert(tk.END, package)
-            self.status.set(f"{len(self.packages)} aplikasi pihak ketiga ditemukan.")
+            packages = [line.replace("package:", "").strip() for line in output.splitlines() if line.startswith("package:")]
+            
+            app_list = []
+            for pkg in packages:
+                app_name = "Tidak diketahui"
+                try:
+                    pkg_info = self.run_adb_local(["shell", "dumpsys", "package", pkg], timeout=4)
+                    for line in pkg_info.splitlines():
+                        if "applicationInfo" in line and "label=" in line:
+                            parts = line.split("label=")
+                            if len(parts) > 1:
+                                app_name = parts[1].split()[0].strip("'\"")
+                                break
+                except Exception:
+                    pass
+
+                if app_name == "Tidak diketahui" or not app_name:
+                    app_name = pkg.split('.')[-1].capitalize()
+
+                app_list.append((app_name, pkg))
+
+            app_list.sort(key=lambda x: x[0].lower())
+
+            for item in self.app_tree.get_children():
+                self.app_tree.delete(item)
+
+            for app_name, pkg in app_list:
+                self.app_tree.insert("", "end", values=(app_name, pkg))
+
+            self.status.set(f"Berhasil memuat {len(app_list)} aplikasi diurutkan secara alfabetis.")
         except Exception as exc:
             self.show_error("Gagal memuat aplikasi", exc)
 
     def force_stop_selected(self):
-        selection = self.package_list.curselection()
-        if not selection:
-            messagebox.showinfo("Pilih aplikasi", "Pilih satu atau beberapa aplikasi dari daftar.", parent=self.root)
+        selected_items = self.app_tree.selection()
+        if not selected_items:
+            messagebox.showinfo("Pilih aplikasi", "Pilih salah satu atau beberapa aplikasi dari tabel terlebih dahulu.", parent=self.root)
             return
-        selected = [self.package_list.get(index) for index in selection]
-        if not messagebox.askyesno("Konfirmasi force stop", "Hentikan aplikasi berikut?\n\n" + "\n".join(selected), parent=self.root):
+        
+        selected_pkgs = [self.app_tree.item(item)['values'][1] for item in selected_items]
+        if not messagebox.askyesno("Konfirmasi force stop", "Hentikan paksa aplikasi berikut?\n\n" + "\n".join(selected_pkgs), parent=self.root):
             return
         try:
-            for package in selected:
+            for package in selected_pkgs:
                 self.run_adb_local(["shell", "am", "force-stop", package], timeout=20)
-            self.status.set(f"{len(selected)} aplikasi dihentikan.")
-            messagebox.showinfo("Selesai", "Perintah force-stop berhasil dikirim.", parent=self.root)
+            self.status.set(f"{len(selected_pkgs)} aplikasi berhasil dihentikan paksa.")
+            messagebox.showinfo("Selesai", "Perintah force-stop berhasil dikirim ke perangkat.", parent=self.root)
         except Exception as exc:
             self.show_error("Gagal force stop", exc)
 
@@ -294,48 +597,11 @@ class RemoteControlApp:
         except Exception as exc:
             self.show_error("Instalasi gagal", exc)
 
-    def start_timer(self):
-        try:
-            minutes = int(self.minutes.get())
-            if minutes < 1 or minutes > 1440:
-                raise ValueError
-        except ValueError:
-            messagebox.showwarning("Batas tidak valid", "Masukkan angka 1 sampai 1440 menit.", parent=self.root)
-            return
-        self.stop_timer()
-        self.timer_running = True
-        self.timer_start = time.monotonic()
-        self.timer_limit = minutes * 60
-        self._tick_timer()
-        self.status.set(f"Timer sesi dimulai: {minutes} menit.")
-
-    def stop_timer(self):
-        self.timer_running = False
-        if self.timer_job is not None:
-            try:
-                self.root.after_cancel(self.timer_job)
-            except tk.TclError:
-                pass
-            self.timer_job = None
-
-    def _tick_timer(self):
-        if not self.timer_running or self.timer_start is None:
-            return
-        elapsed = int(time.monotonic() - self.timer_start)
-        remaining = max(0, self.timer_limit - elapsed)
-        self.timer_label.configure(text=f"{remaining // 60:02d}:{remaining % 60:02d}")
-        if remaining <= 0:
-            self.stop_timer()
-            if messagebox.askyesno("Batas waktu tercapai", "Batas sesi tercapai. Kunci layar HP?", parent=self.root):
-                self.lock_screen()
-            return
-        self.timer_job = self.root.after(1000, self._tick_timer)
-
     def _build_ui(self):
         self.root.configure(bg="#F3F6FC")
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Treeview", rowheight=35)
+        style.configure("Treeview", rowheight=32)
 
         BG, CARD, NAVY, BLUE, TEXT, MUTED, BORDER = "#F3F6FC", "#FFFFFF", "#17243A", "#356DF3", "#243149", "#68758B", "#DCE4F0"
 
@@ -356,7 +622,7 @@ class RemoteControlApp:
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill="x")
         ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(anchor="w")
-        ttk.Label(header, text="USB + ADB • Gunakan hanya pada perangkat milikmu atau yang kamu punya izin untuk kelola.", wraplength=940, style="Subtitle.TLabel").pack(anchor="w", pady=(4, 8))
+        ttk.Label(header, text="USB + ADB", wraplength=940, style="Subtitle.TLabel").pack(anchor="w", pady=(4, 8))
 
         device_frame = ttk.LabelFrame(self.root, text="Perangkat Android", padding=10)
         device_frame.pack(fill="x", padx=12, pady=4)
@@ -371,76 +637,66 @@ class RemoteControlApp:
         notebook.pack(fill="both", expand=True, padx=12, pady=8)
 
         dashboard_tab = ttk.Frame(notebook, padding=16)
-        mirror_tab = ttk.Frame(notebook, padding=12)
+        mirror_usage_tab = ttk.Frame(notebook, padding=12)
         apps_tab = ttk.Frame(notebook, padding=12)
         files_tab = ttk.Frame(notebook, padding=12)
-        usage_tab = ttk.Frame(notebook, padding=12)
+        mem_tab = ttk.Frame(notebook, padding=12)
+        process_tab = ttk.Frame(notebook, padding=12)
 
         notebook.add(dashboard_tab, text="Dashboard")
-        notebook.add(mirror_tab, text="Mirroring & Kontrol")
+        notebook.add(mirror_usage_tab, text="Mirroring, Rekam & Screen Time")
         notebook.add(apps_tab, text="Aplikasi")
 
-        # Tab Memori
-        mem_tab = ttk.Frame(notebook)
+        # ==================== TAB MANAJEMEN MEMORI ====================
         notebook.add(mem_tab, text="Manajemen Memori")
-        mem_top = ttk.Frame(mem_tab, padding=10)
-        mem_top.pack(fill="x")
-        ttk.Label(mem_top, text="Inspeksi Alokasi Memori Fisik & Swapping (Virtual Memory)", font=("Arial", 11, "bold")).pack(anchor="w")
-        ttk.Label(mem_top, text="Menganalisis penggunaan RAM, ruang swap, dan cache berdasarkan struktur kernel /proc/meminfo.").pack(anchor="w", pady=(0, 10))
-        ttk.Button(mem_top, text="Muat Informasi Memori", command=self.load_memory_info).pack(anchor="w")
+        mem_top = ttk.Frame(mem_tab)
+        mem_top.pack(fill="x", pady=6)
+        ttk.Button(mem_top, text="Muat Daftar Aplikasi (Urut Abjad)", command=self.load_memory_packages_list).pack(side="left")
+        ttk.Button(mem_top, text="🔍 Ambil & Cek Memori dari HP", command=self.load_memory_details_for_selected).pack(side="left", padx=8)
 
-        mem_frame = ttk.Frame(mem_tab, padding=10)
-        mem_frame.pack(fill="both", expand=True)
-        mem_columns = ("Parameter", "Nilai (Value)", "Keterangan Konsep OS")
-        self.mem_tree = ttk.Treeview(mem_frame, columns=mem_columns, show="headings", height=12)
-        self.mem_tree.heading("Parameter", text="Parameter Memori")
-        self.mem_tree.heading("Nilai (Value)", text="Nilai (Value)")
-        self.mem_tree.heading("Keterangan Konsep OS", text="Keterangan Konsep OS")
-        self.mem_tree.column("Parameter", width=200, anchor="w", stretch=False)
-        self.mem_tree.column("Nilai (Value)", width=150, anchor="w", stretch=False)
-        self.mem_tree.column("Keterangan Konsep OS", width=500, anchor="w", stretch=True)
-        mem_scroll = ttk.Scrollbar(mem_frame, orient="vertical", command=self.mem_tree.yview)
+        mem_split = ttk.PanedWindow(mem_tab, orient="horizontal")
+        mem_split.pack(fill="both", expand=True, pady=6)
+        mem_left = ttk.Frame(mem_split)
+        mem_right = ttk.Frame(mem_split)
+        mem_split.add(mem_left, weight=1)
+        mem_split.add(mem_right, weight=1)
+
+        self.mem_tree = ttk.Treeview(mem_left, columns=("Nama Aplikasi", "Package"), show="headings", height=18)
+        self.mem_tree.heading("Nama Aplikasi", text="Nama Aplikasi (Label Asli)")
+        self.mem_tree.heading("Package", text="Nama Paket (Package Name)")
+        self.mem_tree.column("Nama Aplikasi", width=200, anchor="w")
+        self.mem_tree.column("Package", width=280, anchor="w")
+        mem_scroll = ttk.Scrollbar(mem_left, orient="vertical", command=self.mem_tree.yview)
         self.mem_tree.configure(yscrollcommand=mem_scroll.set)
         self.mem_tree.pack(side="left", fill="both", expand=True)
         mem_scroll.pack(side="right", fill="y")
 
-        # Tab Sinkronisasi
-        sync_tab = ttk.Frame(notebook)
-        notebook.add(sync_tab, text="Sinkronisasi OS")
-        sync_top = ttk.Frame(sync_tab, padding=10)
-        sync_top.pack(fill="x")
-        ttk.Label(sync_top, text="Simulasi Antrean Proses (Queue) & Proteksi Mutex Lock", font=("Arial", 11, "bold")).pack(anchor="w")
-        ttk.Label(sync_top, text="Mengatur eksekusi perintah konkuren agar tidak terjadi bentrok sumber daya (race condition).").pack(anchor="w", pady=(0, 10))
-        ttk.Button(sync_top, text="Jalankan Simulasi Antrean Konkuren", command=self.test_concurrency_sync).pack(anchor="w")
-
-        sync_frame = ttk.Frame(sync_tab, padding=10)
-        sync_frame.pack(fill="both", expand=True)
-        sync_scroll = ttk.Scrollbar(sync_frame, orient="vertical")
-        sync_scroll.pack(side="right", fill="y")
-        self.sync_log = tk.Text(sync_frame, wrap="word", bg="#1e1e1e", fg="#00ff00", font=("Courier", 10), yscrollcommand=sync_scroll.set)
-        self.sync_log.pack(side="left", fill="both", expand=True)
-        sync_scroll.config(command=self.sync_log.yview)
+        self.mem_detail_box = tk.Text(mem_right, wrap="word", bg="#121212", fg="#00FF00", font=("DejaVu Sans Mono", 10))
+        self.mem_detail_box.pack(fill="both", expand=True)
+        # ==============================================================================================
 
         # Dashboard content
         ttk.Label(dashboard_tab, text="Ringkasan Perangkat", font=("TkDefaultFont", 16, "bold")).pack(anchor="w", pady=(0, 12))
-        self.dashboard_connection = tk.StringVar(value="Memeriksa koneksi...")
-        self.dashboard_model = tk.StringVar(value="-")
-        self.dashboard_android = tk.StringVar(value="-")
-        self.dashboard_battery = tk.StringVar(value="-")
-        self.dashboard_storage = tk.StringVar(value="-")
 
-        info_frame = ttk.LabelFrame(dashboard_tab, text="Informasi HP", padding=12)
+        info_frame = ttk.LabelFrame(dashboard_tab, text="Informasi Lengkap HP (About Phone)", padding=12)
         info_frame.pack(fill="x", pady=4)
 
         for label, variable in [
             ("Status koneksi", self.dashboard_connection),
-            ("Model perangkat", self.dashboard_model),
+            ("Nama perangkat", self.dashboard_device_name),
+            ("Model", self.dashboard_model),
+            ("RAM", self.dashboard_ram),
+            ("CPU / Chipset", self.dashboard_cpu),
+            ("Versi OS / UI", self.dashboard_os),
             ("Versi Android", self.dashboard_android),
+            ("Update keamanan", self.dashboard_security),
+            ("Versi pita basis", self.dashboard_baseband),
+            ("Versi kernel", self.dashboard_kernel),
             ("Baterai", self.dashboard_battery),
-            ("Penyimpanan /data", self.dashboard_storage),
+            ("Penyimpanan", self.dashboard_storage),
         ]:
             line = ttk.Frame(info_frame)
-            line.pack(fill="x", pady=5)
+            line.pack(fill="x", pady=3)
             ttk.Label(line, text=label, width=22).pack(side="left")
             ttk.Label(line, textvariable=variable, font=("TkDefaultFont", 10, "bold")).pack(side="left", fill="x", expand=True)
 
@@ -449,24 +705,57 @@ class RemoteControlApp:
         ttk.Button(dashboard_buttons, text="Perbarui informasi", command=self.refresh_dashboard).pack(side="left")
         ttk.Button(dashboard_buttons, text="Refresh perangkat", command=self.refresh_devices).pack(side="left", padx=8)
 
-        # Tab Manajemen Proses
-        process_tab = ttk.Frame(notebook, padding=12)
+        # Tab Mirroring, Rekam & Screen Time
+        ttk.Label(mirror_usage_tab, text="Kontrol Layar & Perekaman (Scrcpy)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 4))
+        
+        control_row = ttk.Frame(mirror_usage_tab)
+        control_row.pack(anchor="w", pady=4)
+        ttk.Button(control_row, text="Mulai Mirroring", command=self.start_mirroring).pack(side="left", padx=(0, 6))
+        ttk.Button(control_row, text="Mirroring + Layar Mati", command=self.start_mirroring_screen_off).pack(side="left", padx=6)
+        ttk.Button(control_row, text="🔴 Rekam Layar", command=self.start_recording).pack(side="left", padx=6)
+        ttk.Button(control_row, text="Kunci Layar HP", command=self.lock_screen).pack(side="left", padx=6)
+        ttk.Button(control_row, text="Bangunkan Layar", command=self.wake_screen).pack(side="left", padx=6)
+
+        timer_box = ttk.LabelFrame(mirror_usage_tab, text="Timer Batas Sesi & Penguncian PIN (12345678)", padding=8)
+        timer_box.pack(fill="x", pady=8)
+        time_row = ttk.Frame(timer_box)
+        time_row.pack(anchor="w", pady=2)
+        ttk.Label(time_row, text="Batas sesi (menit):").pack(side="left")
+        ttk.Entry(time_row, textvariable=self.minutes, width=8).pack(side="left", padx=8)
+        ttk.Button(time_row, text="Mulai Timer", command=self.start_timer).pack(side="left", padx=4)
+        ttk.Button(time_row, text="Hentikan Timer", command=self.stop_timer).pack(side="left", padx=4)
+        ttk.Button(time_row, text="🔓 Buka Kunci (PIN: 12345678)", command=self.unlock_session).pack(side="left", padx=12)
+        
+        self.timer_label = ttk.Label(timer_box, text="00:00", font=("TkDefaultFont", 14, "bold"))
+        self.timer_label.pack(anchor="w", pady=4)
+
+        st_box = ttk.LabelFrame(mirror_usage_tab, text="Detail Aktivitas Aplikasi Real-Time (Digital Wellbeing Style)", padding=8)
+        st_box.pack(fill="both", expand=True, pady=6)
+        
+        st_top = ttk.Frame(st_box)
+        st_top.pack(fill="x", pady=4)
+        ttk.Label(st_top, text="Pilih Periode:").pack(side="left", padx=(0, 6))
+        ttk.Button(st_top, text="📅 Hari Ini (Daily)", command=lambda: self.load_screen_time_by_period("daily")).pack(side="left", padx=4)
+        ttk.Button(st_top, text="📊 Minggu Ini (Weekly)", command=lambda: self.load_screen_time_by_period("weekly")).pack(side="left", padx=4)
+        ttk.Button(st_top, text="📈 1 Bulan (Monthly)", command=lambda: self.load_screen_time_by_period("monthly")).pack(side="left", padx=4)
+        ttk.Button(st_top, text="📉 1 Tahun (Yearly)", command=lambda: self.load_screen_time_by_period("yearly")).pack(side="left", padx=4)
+        
+        st_frame = ttk.Frame(st_box)
+        st_frame.pack(fill="both", expand=True, pady=4)
+        st_scroll = ttk.Scrollbar(st_frame, orient="vertical")
+        st_scroll.pack(side="right", fill="y")
+        self.st_text = tk.Text(st_frame, wrap="word", bg="#121212", fg="#FFFFFF", font=("DejaVu Sans Mono", 10), yscrollcommand=st_scroll.set)
+        self.st_text.pack(side="left", fill="both", expand=True)
+        st_scroll.config(command=self.st_text.yview)
+
+        # Tab Manajemen Proses & CPU
         notebook.add(process_tab, text="Manajemen Proses & CPU")
         ttk.Label(process_tab, text="Daftar Proses Android & Penjadwalan (Process Table)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
-        ttk.Label(process_tab, text="Menampilkan PID, Status, Prioritas (Nice), dan CPU Usage (%) dari kernel Android.").pack(anchor="w", pady=4)
-
+        
         proc_top = ttk.Frame(process_tab)
         proc_top.pack(fill="x", pady=6)
         ttk.Button(proc_top, text="Muat Proses (PS)", command=self.load_processes).pack(side="left")
         ttk.Button(proc_top, text="Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
-
-        self.auto_refresh_var = tk.BooleanVar(value=False)
-        self.auto_refresh_btn = ttk.Checkbutton(
-            proc_top, text="Auto-Refresh (Real-Time)", 
-            variable=self.auto_refresh_var, 
-            command=self.toggle_auto_refresh
-        )
-        self.auto_refresh_btn.pack(side="left", padx=12)
 
         tree_frame = ttk.Frame(process_tab)
         tree_frame.pack(fill="both", expand=True, pady=4)
@@ -475,7 +764,7 @@ class RemoteControlApp:
             tree_frame, 
             columns=("PID", "USER", "STATUS", "NICE", "CPU (%)", "Command / Nama Proses"),
             show="headings",
-            height=30
+            height=25
         )
         self.proc_tree.heading("PID", text="PID")
         self.proc_tree.heading("USER", text="User")
@@ -484,97 +773,59 @@ class RemoteControlApp:
         self.proc_tree.heading("CPU (%)", text="CPU (%)")
         self.proc_tree.heading("Command / Nama Proses", text="Command / Nama Proses")
 
-        self.proc_tree.column("PID", width=200, anchor="center", stretch=False)
-        self.proc_tree.column("USER", width=200, anchor="center", stretch=False)
-        self.proc_tree.column("STATUS", width=200, anchor="center", stretch=False)
-        self.proc_tree.column("NICE", width=200, anchor="center", stretch=False)
-        self.proc_tree.column("CPU (%)", width=200, anchor="center", stretch=False)
-        self.proc_tree.column("Command / Nama Proses", width=500, anchor="w", stretch=True)
+        self.proc_tree.column("PID", width=70, anchor="center")
+        self.proc_tree.column("USER", width=90, anchor="center")
+        self.proc_tree.column("STATUS", width=70, anchor="center")
+        self.proc_tree.column("NICE", width=70, anchor="center")
+        self.proc_tree.column("CPU (%)", width=70, anchor="center")
+        self.proc_tree.column("Command / Nama Proses", width=450, anchor="w")
 
         proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
         self.proc_tree.configure(yscrollcommand=proc_scroll.set)
         self.proc_tree.pack(side="left", fill="both", expand=True)
         proc_scroll.pack(side="right", fill="y")
 
+        # Tab Transfer File
         notebook.add(files_tab, text="Transfer File")
-        notebook.add(usage_tab, text="Screen Time")
-
-        # Mirroring tab
-        ttk.Label(mirror_tab, text="Mirroring menggunakan scrcpy", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
-        ttk.Label(mirror_tab, text="scrcpy membuka jendela layar HP terpisah dan meneruskan klik, scroll, serta ketikan keyboard.").pack(anchor="w", pady=6)
-        row = ttk.Frame(mirror_tab)
-        row.pack(anchor="w", pady=8)
-        ttk.Button(row, text="Mulai mirroring", command=self.start_mirroring).pack(side="left", padx=(0, 8))
-        ttk.Button(row, text="Mirroring + layar HP mati", command=self.start_mirroring_screen_off).pack(side="left", padx=8)
-        ttk.Button(row, text="Kunci layar HP", command=self.lock_screen).pack(side="left", padx=8)
-        ttk.Button(row, text="Bangunkan layar", command=self.wake_screen).pack(side="left", padx=8)
-
-        # Apps tab
-        app_top = ttk.Frame(apps_tab)
-        app_top.pack(fill="x")
-        ttk.Label(app_top, text="Daftar aplikasi pihak ketiga pada HP:").pack(side="left")
-        ttk.Button(app_top, text="Muat daftar", command=self.load_packages).pack(side="left", padx=8)
-        ttk.Button(app_top, text="Force stop terpilih", command=self.force_stop_selected).pack(side="left", padx=4)
-        list_frame = ttk.Frame(apps_tab)
-        list_frame.pack(fill="both", expand=True, pady=4)
-        self.package_list = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=18, font=("DejaVu Sans Mono", 10))
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.package_list.yview)
-        self.package_list.configure(yscrollcommand=scrollbar.set)
-        self.package_list.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Files tab
         ttk.Label(files_tab, text="Kirim file dari laptop ke folder Download HP.").pack(anchor="w")
         ttk.Button(files_tab, text="Pilih file lalu kirim ke HP", command=self.push_file).pack(anchor="w", pady=8)
         ttk.Label(files_tab, text="Pilih APK untuk memasangnya pada HP yang terhubung.").pack(anchor="w", pady=(16, 0))
         ttk.Button(files_tab, text="Pilih APK lalu instal", command=self.install_apk).pack(anchor="w", pady=8)
 
-        # Usage tab
-        ttk.Label(usage_tab, text="Timer sesi pemantauan", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
-        time_row = ttk.Frame(usage_tab)
-        time_row.pack(anchor="w", pady=8)
-        ttk.Label(time_row, text="Batas sesi (menit):").pack(side="left")
-        ttk.Entry(time_row, textvariable=self.minutes, width=8).pack(side="left", padx=8)
-        ttk.Button(time_row, text="Mulai timer", command=self.start_timer).pack(side="left", padx=4)
-        ttk.Button(time_row, text="Hentikan timer", command=self.stop_timer).pack(side="left", padx=4)
-        self.timer_label = ttk.Label(usage_tab, text="00:00", font=("TkDefaultFont", 24, "bold"))
-        self.timer_label.pack(anchor="w", pady=12)
+        # Tab Aplikasi
+        notebook.add(apps_tab, text="Aplikasi")
+        app_top = ttk.Frame(apps_tab)
+        app_top.pack(fill="x", pady=6)
+        ttk.Button(app_top, text="Muat Daftar Aplikasi (Urut Abjad)", command=self.load_packages).pack(side="left")
+        ttk.Button(app_top, text="Force Stop Terpilih", command=self.force_stop_selected).pack(side="left", padx=8)
+
+        app_frame = ttk.Frame(apps_tab)
+        app_frame.pack(fill="both", expand=True, pady=4)
+
+        self.app_tree = ttk.Treeview(
+            app_frame,
+            columns=("Nama Aplikasi", "Nama Paket (Package)"),
+            show="headings",
+            height=20,
+            selectmode="extended"
+        )
+        self.app_tree.heading("Nama Aplikasi", text="Nama Aplikasi (Urut Abjad)")
+        self.app_tree.heading("Nama Paket (Package)", text="Nama Paket (Package Name)")
+        self.app_tree.column("Nama Aplikasi", width=250, anchor="w")
+        self.app_tree.column("Nama Paket (Package)", width=500, anchor="w")
+
+        app_scroll = ttk.Scrollbar(app_frame, orient="vertical", command=self.app_tree.yview)
+        self.app_tree.configure(yscrollcommand=app_scroll.set)
+        self.app_tree.pack(side="left", fill="both", expand=True)
+        app_scroll.pack(side="right", fill="y")
 
         footer = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         footer.pack(fill="x")
         ttk.Separator(footer).pack(fill="x", pady=(0, 8))
-        ttk.Label(footer, text="Status: ADB hanya berfungsi setelah otorisasi USB Debugging disetujui pada HP.").pack(anchor="w")
-
-    def toggle_auto_refresh(self):
-        """Mengaktifkan atau menonaktifkan pembaruan proses secara real-time."""
-        if self.auto_refresh_var.get():
-            self.status.set("Auto-refresh proses real-time diaktifkan (setiap 3 detik).")
-            self._realtime_process_loop()
-        else:
-            self.status.set("Auto-refresh proses dinonaktifkan.")
-
-    def _realtime_process_loop(self):
-        """Looping otomatis untuk memperbarui tabel proses secara berkala."""
-        # Periksa apakah checkbox masih dicentang dan tab aktif
-        if getattr(self, 'auto_refresh_var', None) and self.auto_refresh_var.get():
-            try:
-                # Muat ulang proses secara senyap di latar belakang
-                device_id = self.device.get().strip()
-                if device_id:
-                    processes = self.os_handler.get_process_table(device_id)
-                    for item in self.proc_tree.get_children():
-                        self.proc_tree.delete(item)
-                    for proc in processes:
-                        self.proc_tree.insert("", "end", values=proc)
-            except Exception:
-                pass  # Abaikan jeda sesaat saat kabel/adb sibuk
-
-            # Jadwalkan eksekusi berikutnya setelah 3 detik (3000 ms)
-            self.root.after(3000, self._realtime_process_loop)
+        ttk.Label(footer, text="Status: ADB aktif.").pack(anchor="w")
 
     def on_close(self):
         self.stop_timer()
-        self.os_handler.is_worker_running = False
         self.root.destroy()
 
 
