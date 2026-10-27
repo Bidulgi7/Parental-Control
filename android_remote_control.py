@@ -64,7 +64,7 @@ class RemoteControlApp:
         messagebox.showerror(title, str(error), parent=self.root)
 
     def load_memory_details_for_selected(self):
-        """Mengambil data memori Pure APK, Data, dan Cache secara akurat dari sistem HP."""
+        """Mengambil data penggunaan RAM aktif (PSS) secara real-time beserta panduan untuk orang awam."""
         selected_item = self.mem_tree.selection()
         if not selected_item:
             messagebox.showinfo("Pilih Aplikasi", "Pilih salah satu aplikasi dari tabel terlebih dahulu.", parent=self.root)
@@ -74,79 +74,45 @@ class RemoteControlApp:
         app_name = item_data[0]
         pkg_name = item_data[1]
         
-        self.status.set(f"Mengambil data memori HP untuk {app_name}...")
+        self.status.set(f"Mengambil data RAM aktif untuk {app_name}...")
         self.root.update()
 
         try:
-            # 1. Ambil path file APK untuk menghitung ukuran file instalasi (Code Size)
-            apk_path_out = self.run_adb_local(["shell", "pm", "path", pkg_name], timeout=8)
-            code_size_str = "Tidak diketahui"
-            
-            for line in apk_path_out.splitlines():
-                if line.startswith("package:"):
-                    apk_file = line.replace("package:", "").strip()
-                    size_res = self.run_adb_local(["shell", "stat", "-c", "%s", apk_file], timeout=6)
-                    if size_res.strip().isdigit():
-                        b = int(size_res.strip())
-                        code_size_str = f"{b / (1024*1024):.2f} MB ({b:,} bytes)"
-                        break
-
-            # 2. Ambil data ukuran dari dumpsys package untuk Data & Cache
-            pkg_output = self.run_adb_local(["shell", "dumpsys", "package", pkg_name], timeout=10)
-            data_size = "Tidak diketahui"
-            cache_size = "Tidak diketahui"
-            
-            for line in pkg_output.splitlines():
-                line_str = line.strip()
-                if "dataSize=" in line_str:
-                    data_size = line_str.split("dataSize=")[1].split()[0]
-                elif "cacheSize=" in line_str:
-                    cache_size = line_str.split("cacheSize=")[1].split()[0]
-
-            def format_bytes(b_str):
-                try:
-                    b = int(b_str)
-                    if b > 1024 * 1024 * 1024:
-                        return f"{b / (1024*1024*1024):.2f} GB ({b:,} bytes)"
-                    elif b > 1024 * 1024:
-                        return f"{b / (1024*1024):.2f} MB ({b:,} bytes)"
-                    elif b > 1024:
-                        return f"{b / 1024:.2f} KB ({b:,} bytes)"
-                    return f"{b} bytes"
-                except Exception:
-                    return b_str
-
-            # 3. Ambil penggunaan RAM aktif (PSS)
             mem_output = self.run_adb_local(["shell", "dumpsys", "meminfo", pkg_name], timeout=10)
 
             detail_text = f"===========================================================\n"
-            detail_text += f" ANALISIS MEMORI HP: {app_name}\n"
+            detail_text += f" ANALISIS RAM AKTIF APLIKASI: {app_name}\n"
             detail_text += f" Package: {pkg_name}\n"
             detail_text += f"===========================================================\n\n"
             
-            detail_text += f"📦 1. DATA PURE APK (Ukuran Install Asli):\n"
-            detail_text += f"   • Code Size (APK): {code_size_str}\n\n"
-            
-            detail_text += f"📊 2. DATA SETELAH PEMAKAIAN (User Data & Cache):\n"
-            detail_text += f"   • Data Size: {format_bytes(data_size)}\n"
-            detail_text += f"   • Cache Size: {format_bytes(cache_size)}\n\n"
-            
-            detail_text += f"🧠 3. PENGGUNAAN RAM AKTIF (PSS):\n"
+            detail_text += f"🧠 PENGGUNAAN MEMORI RAM AKTIF (PSS):\n\n"
             
             ram_lines_found = False
             for line in mem_output.splitlines():
-                if "TOTAL" in line or "RAM" in line or "PSS" in line or "Native Heap" in line or "Dalvik Heap" in line:
-                    detail_text += f"   {line.strip()}\n"
+                line_str = line.strip()
+                if any(k in line_str for k in ["TOTAL", "PSS", "Native Heap", "Dalvik Heap", "Graphics", "Views", "Assets", "DB"]):
+                    detail_text += f"   • {line_str}\n"
                     ram_lines_found = True
 
             if not ram_lines_found:
-                detail_text += f"   (Aplikasi sedang tidak aktif berjalan di latar belakang)\n"
+                detail_text += f"   (Aplikasi sedang tidak aktif berjalan di latar belakang/RAM kosong)\n"
+            else:
+                # Tambahan panduan agar mudah dipahami orang awam
+                detail_text += f"\n-----------------------------------------------------------\n"
+                detail_text += f" 📖 PANDUAN RINGKAS UNTUK ORANG AWAM:\n"
+                detail_text += f"   • TOTAL PSS: Jumlah total memori RAM fisik yang sedang\n"
+                detail_text += f"     dipakai oleh aplikasi ini (semakin kecil, semakin ringan).\n"
+                detail_text += f"   • Native & Dalvik Heap: Ruang memori untuk menjalankan\n"
+                detail_text += f"     sistem inti dan bahasa pemrograman aplikasi.\n"
+                detail_text += f"   • Graphics: Memori yang terpakai untuk tampilan/gambar.\n"
+                detail_text += f"   • Swap PSS: Data aplikasi yang dipindah ke memori virtual\n"
+                detail_text += f"     sementara agar RAM utama tidak terlalu penuh.\n"
 
             self.mem_detail_box.delete("1.0", tk.END)
             self.mem_detail_box.insert(tk.END, detail_text)
-            self.status.set(f"Berhasil memuat data memori HP untuk {app_name}.")
+            self.status.set(f"Berhasil memuat data RAM aktif untuk {app_name}.")
         except Exception as exc:
-            self.show_error("Gagal Memuat Memori HP", exc)
+            self.show_error("Gagal Memuat Memori", exc)
 
     def load_memory_packages_list(self):
         """Memuat daftar aplikasi pihak ketiga dengan label nama asli, diurutkan abjad."""
@@ -652,7 +618,7 @@ class RemoteControlApp:
         mem_top = ttk.Frame(mem_tab)
         mem_top.pack(fill="x", pady=6)
         ttk.Button(mem_top, text="Muat Daftar Aplikasi (Urut Abjad)", command=self.load_memory_packages_list).pack(side="left")
-        ttk.Button(mem_top, text="🔍 Ambil & Cek Memori dari HP", command=self.load_memory_details_for_selected).pack(side="left", padx=8)
+        ttk.Button(mem_top, text="🔍 Cek RAM Aktif (PSS) + Panduan Awam", command=self.load_memory_details_for_selected).pack(side="left", padx=8)
 
         mem_split = ttk.PanedWindow(mem_tab, orient="horizontal")
         mem_split.pack(fill="both", expand=True, pady=6)
