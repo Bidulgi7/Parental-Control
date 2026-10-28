@@ -20,8 +20,8 @@ class RemoteControlApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1050x780")
-        self.root.minsize(850, 640)
+        self.root.geometry("1100x780")
+        self.root.minsize(900, 640)
 
         self.os_handler = OSFeaturesHandler(self.run_adb)
         self.device = tk.StringVar()
@@ -64,7 +64,7 @@ class RemoteControlApp:
         messagebox.showerror(title, str(error), parent=self.root)
 
     def load_memory_details_for_selected(self):
-        """Mengambil data penggunaan RAM aktif (PSS) secara real-time beserta panduan untuk orang awam."""
+        """Mengambil data RAM aktif secara real-time dan mendeteksi apakah aplikasi sedang aktif atau tidak."""
         selected_item = self.mem_tree.selection()
         if not selected_item:
             messagebox.showinfo("Pilih Aplikasi", "Pilih salah satu aplikasi dari tabel terlebih dahulu.", parent=self.root)
@@ -79,40 +79,80 @@ class RemoteControlApp:
 
         try:
             mem_output = self.run_adb_local(["shell", "dumpsys", "meminfo", pkg_name], timeout=10)
+            
+            native_heap, dalvik_heap, graphics = "0 KB", "0 KB", "0 KB"
+            total_pss, total_rss, swap_pss = "0 KB", "0 KB", "0 KB"
+            has_active_process = False
+
+            for line in mem_output.splitlines():
+                line_str = line.strip()
+                parts = line_str.split()
+                
+                if line_str.startswith("Native Heap") and len(parts) >= 2:
+                    for p in parts[1:]:
+                        clean_p = ''.join(filter(str.isdigit, p))
+                        if clean_p:
+                            native_heap = f"{clean_p} KB"
+                            if int(clean_p) > 0:
+                                has_active_process = True
+                            break
+                elif line_str.startswith("Dalvik Heap") and len(parts) >= 2:
+                    for p in parts[1:]:
+                        clean_p = ''.join(filter(str.isdigit, p))
+                        if clean_p:
+                            dalvik_heap = f"{clean_p} KB"
+                            if int(clean_p) > 0:
+                                has_active_process = True
+                            break
+                elif line_str.startswith("Graphics:") and len(parts) >= 2:
+                    for p in parts[1:]:
+                        clean_p = ''.join(filter(str.isdigit, p))
+                        if clean_p:
+                            graphics = f"{clean_p} KB"
+                            break
+                elif line_str.startswith("TOTAL PSS:") and len(parts) >= 3:
+                    clean_p = ''.join(filter(str.isdigit, parts[2]))
+                    if clean_p:
+                        total_pss = f"{clean_p} KB"
+                        if int(clean_p) > 0:
+                            has_active_process = True
+                elif line_str.startswith("TOTAL RSS:") and len(parts) >= 3:
+                    clean_p = ''.join(filter(str.isdigit, parts[2]))
+                    if clean_p:
+                        total_rss = f"{clean_p} KB"
+                elif "TOTAL SWAP PSS:" in line_str or "SWAP PSS:" in line_str:
+                    for p in parts:
+                        clean_p = ''.join(filter(str.isdigit, p))
+                        if clean_p and int(clean_p) > 0:
+                            swap_pss = f"{clean_p} KB"
+                            break
 
             detail_text = f"===========================================================\n"
-            detail_text += f" ANALISIS RAM AKTIF APLIKASI: {app_name}\n"
+            detail_text += f" ANALISIS RAM AKTIF: {app_name}\n"
             detail_text += f" Package: {pkg_name}\n"
             detail_text += f"===========================================================\n\n"
             
-            detail_text += f"🧠 PENGGUNAAN MEMORI RAM AKTIF (PSS):\n\n"
-            
-            ram_lines_found = False
-            for line in mem_output.splitlines():
-                line_str = line.strip()
-                if any(k in line_str for k in ["TOTAL", "PSS", "Native Heap", "Dalvik Heap", "Graphics", "Views", "Assets", "DB"]):
-                    detail_text += f"   • {line_str}\n"
-                    ram_lines_found = True
-
-            if not ram_lines_found:
-                detail_text += f"   (Aplikasi sedang tidak aktif berjalan di latar belakang/RAM kosong)\n"
+            if not has_active_process:
+                detail_text += f"⚠️ STATUS: Aplikasi sedang tidak digunakan / tidak aktif di RAM.\n\n"
             else:
-                # Tambahan panduan agar mudah dipahami orang awam
-                detail_text += f"\n-----------------------------------------------------------\n"
-                detail_text += f" 📖 PANDUAN RINGKAS UNTUK ORANG AWAM:\n"
-                detail_text += f"   • TOTAL PSS: Jumlah total memori RAM fisik yang sedang\n"
-                detail_text += f"     dipakai oleh aplikasi ini (semakin kecil, semakin ringan).\n"
-                detail_text += f"   • Native & Dalvik Heap: Ruang memori untuk menjalankan\n"
-                detail_text += f"     sistem inti dan bahasa pemrograman aplikasi.\n"
-                detail_text += f"   • Graphics: Memori yang terpakai untuk tampilan/gambar.\n"
-                detail_text += f"   • Swap PSS: Data aplikasi yang dipindah ke memori virtual\n"
-                detail_text += f"     sementara agar RAM utama tidak terlalu penuh.\n"
+                detail_text += f"🧠 RINCIAN PENGGUNAAN RAM:\n\n"
+                detail_text += f"+-------------------+-------------------+--------------------------------------------------+\n"
+                detail_text += f"| Komponen Memori   | Besar Angka       | Penjelasan (Arti & Fungsinya)                    |\n"
+                detail_text += f"+-------------------+-------------------+--------------------------------------------------+\n"
+                detail_text += f"| Native Heap       | {native_heap:<17} | Memori untuk sistem inti & bahasa C/C++          |\n"
+                detail_text += f"| Dalvik Heap       | {dalvik_heap:<17} | Memori bahasa pemrograman aplikasi (Java/Kotlin) |\n"
+                detail_text += f"| Graphics          | {graphics:<17} | Memori khusus untuk memproses tampilan visual    |\n"
+                detail_text += f"| TOTAL PSS         | {total_pss:<17} | Total memori RAM fisik nyata yang sedang dipakai |\n"
+                detail_text += f"| TOTAL RSS         | {total_rss:<17} | Total keseluruhan memori termasuk memori bersama |\n"
+                detail_text += f"| SWAP PSS          | {swap_pss:<17} | Data dipindah ke memori virtual agar RAM longgar |\n"
+                detail_text += f"+-------------------+-------------------+--------------------------------------------------+\n\n"
+                detail_text += f"💡 Tips: Semakin kecil nilai TOTAL PSS, semakin ringan aplikasi tersebut di RAM HP.\n"
 
             self.mem_detail_box.delete("1.0", tk.END)
             self.mem_detail_box.insert(tk.END, detail_text)
-            self.status.set(f"Berhasil memuat data RAM aktif untuk {app_name}.")
+            self.status.set(f"Berhasil memuat analisis RAM aktif untuk {app_name}.")
         except Exception as exc:
-            self.show_error("Gagal Memuat Memori", exc)
+            self.show_error("Gagal Memuat RAM Aktif", exc)
 
     def load_memory_packages_list(self):
         """Memuat daftar aplikasi pihak ketiga dengan label nama asli, diurutkan abjad."""
@@ -219,14 +259,48 @@ class RemoteControlApp:
             self.show_error(f"Gagal memuat screen time {period}", exc)
 
     def load_processes(self):
+        """Memuat daftar proses real-time lengkap dengan data mentah top/ps serta menyertakan terjemahan Nama Aplikasi & Package di kolom tersendiri."""
         try:
             device_id = self.device.get().strip()
-            processes = self.os_handler.get_process_table(device_id)
+            if not device_id:
+                messagebox.showwarning("Perangkat Belum Dipilih", "Pilih perangkat HP terlebih dahulu.", parent=self.root)
+                return
+
+            self.status.set("Mengambil daftar proses real-time dan mendeteksi nama aplikasi...")
+            self.root.update()
+
+            raw_processes = self.os_handler.get_process_table(device_id)
             for item in self.proc_tree.get_children():
                 self.proc_tree.delete(item)
-            for proc in processes:
-                self.proc_tree.insert("", "end", values=proc)
-            self.status.set("Berhasil memuat daftar proses dan penggunaan CPU perangkat.")
+
+            for proc in raw_processes:
+                # proc format dari os_features: (PID, USER, STATUS, NICE, CPU, COMMAND)
+                pid, user, status, nice, cpu, command = proc
+                
+                # Deteksi Nama Package dan Nama Label Aplikasi dari command
+                app_label = "Sistem / Layanan Android"
+                pkg_name = "-"
+                
+                parts = command.split()
+                for p in parts:
+                    if "." in p and not p.startswith("/") and not p.startswith("["):
+                        pkg_name = p
+                        # Buat nama label aplikasi yang mudah dibaca dari bagian akhir package
+                        app_label = f"📱 {pkg_name.split('.')[-1].capitalize()} ({pkg_name})"
+                        break
+                
+                if pkg_name == "-":
+                    if "kworker" in command:
+                        app_label = "⚙️ Kernel Worker (Sistem)"
+                    elif "surfaceflinger" in command:
+                        app_label = "🖼️ SurfaceFlinger (Layar)"
+                    elif "system_server" in command:
+                        app_label = "🧠 System Server (Inti Android)"
+
+                # Masukkan ke tabel dengan kolom tambahan Nama Aplikasi / Info Jelas
+                self.proc_tree.insert("", "end", values=(pid, user, status, nice, cpu, app_label, command))
+
+            self.status.set(f"Berhasil memuat {len(raw_processes)} proses aktif secara real-time.")
         except Exception as exc:
             self.show_error("Gagal memuat proses", exc)
 
@@ -618,7 +692,7 @@ class RemoteControlApp:
         mem_top = ttk.Frame(mem_tab)
         mem_top.pack(fill="x", pady=6)
         ttk.Button(mem_top, text="Muat Daftar Aplikasi (Urut Abjad)", command=self.load_memory_packages_list).pack(side="left")
-        ttk.Button(mem_top, text="🔍 Cek RAM Aktif (PSS) + Panduan Awam", command=self.load_memory_details_for_selected).pack(side="left", padx=8)
+        ttk.Button(mem_top, text="🔍 Analisis RAM Aktif", command=self.load_memory_details_for_selected).pack(side="left", padx=8)
 
         mem_split = ttk.PanedWindow(mem_tab, orient="horizontal")
         mem_split.pack(fill="both", expand=True, pady=6)
@@ -714,21 +788,21 @@ class RemoteControlApp:
         self.st_text.pack(side="left", fill="both", expand=True)
         st_scroll.config(command=self.st_text.yview)
 
-        # Tab Manajemen Proses & CPU
+        # ==================== TAB MANAJEMEN PROSES & CPU ====================
         notebook.add(process_tab, text="Manajemen Proses & CPU")
-        ttk.Label(process_tab, text="Daftar Proses Android & Penjadwalan (Process Table)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
         
         proc_top = ttk.Frame(process_tab)
         proc_top.pack(fill="x", pady=6)
-        ttk.Button(proc_top, text="Muat Proses (PS)", command=self.load_processes).pack(side="left")
-        ttk.Button(proc_top, text="Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
+        ttk.Button(proc_top, text="🔄 Muat Proses (Real-Time)", command=self.load_processes).pack(side="left")
+        ttk.Button(proc_top, text="⚙️ Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
 
         tree_frame = ttk.Frame(process_tab)
         tree_frame.pack(fill="both", expand=True, pady=4)
 
+        # Menambahkan kolom "Nama Aplikasi & Keterangan Jelas" di sebelah data mentah aslinya
         self.proc_tree = ttk.Treeview(
             tree_frame, 
-            columns=("PID", "USER", "STATUS", "NICE", "CPU (%)", "Command / Nama Proses"),
+            columns=("PID", "USER", "STATUS", "NICE", "CPU (%)", "Nama Aplikasi / Info Jelas", "Command / Raw Data Asli"),
             show="headings",
             height=25
         )
@@ -737,19 +811,22 @@ class RemoteControlApp:
         self.proc_tree.heading("STATUS", text="Status")
         self.proc_tree.heading("NICE", text="Nice (NI)")
         self.proc_tree.heading("CPU (%)", text="CPU (%)")
-        self.proc_tree.heading("Command / Nama Proses", text="Command / Nama Proses")
+        self.proc_tree.heading("Nama Aplikasi / Info Jelas", text="🏷️ Nama Aplikasi & Package Jelas")
+        self.proc_tree.heading("Command / Raw Data Asli", text="Command / Raw Data Asli")
 
-        self.proc_tree.column("PID", width=70, anchor="center")
-        self.proc_tree.column("USER", width=90, anchor="center")
-        self.proc_tree.column("STATUS", width=70, anchor="center")
-        self.proc_tree.column("NICE", width=70, anchor="center")
-        self.proc_tree.column("CPU (%)", width=70, anchor="center")
-        self.proc_tree.column("Command / Nama Proses", width=450, anchor="w")
+        self.proc_tree.column("PID", width=60, anchor="center")
+        self.proc_tree.column("USER", width=80, anchor="center")
+        self.proc_tree.column("STATUS", width=60, anchor="center")
+        self.proc_tree.column("NICE", width=60, anchor="center")
+        self.proc_tree.column("CPU (%)", width=60, anchor="center")
+        self.proc_tree.column("Nama Aplikasi / Info Jelas", width=260, anchor="w")
+        self.proc_tree.column("Command / Raw Data Asli", width=340, anchor="w")
 
         proc_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.proc_tree.yview)
         self.proc_tree.configure(yscrollcommand=proc_scroll.set)
         self.proc_tree.pack(side="left", fill="both", expand=True)
         proc_scroll.pack(side="right", fill="y")
+        # ==============================================================================================
 
         # Tab Transfer File
         notebook.add(files_tab, text="Transfer File")
