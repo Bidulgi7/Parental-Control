@@ -17,7 +17,7 @@ class OSFeaturesHandler:
                 
             lines = output_ps.splitlines()
             
-            # 2. Ambil SEMUA file cmdline dari direktori /proc sekaligus dalam 1 kali perintah ADB (Sangat Cepat)
+            # 2. Ambil SEMUA file cmdline dari direktori /proc sekaligus dalam 1 kali perintah ADB
             cmdlines = {}
             try:
                 raw_cmdlines = self.run_adb_func(device_id, args=["shell", "for d in /proc/[0-9]*; do echo \"${d##*/}: $(cat $d/cmdline 2>/dev/null)\"; done"], timeout=3)
@@ -32,18 +32,16 @@ class OSFeaturesHandler:
             except Exception:
                 pass
 
-            # 3. Gabungkan data ps dengan cmdline utuh secara lokal di memori Python (Tanpa jeda ADB beruntun)
+            # 3. Gabungkan data ps dengan cmdline utuh secara lokal di memori Python
             if len(lines) > 1:
                 for line in lines[1:]:
                     tokens = line.split(None, 11)
                     if len(tokens) >= 12:
                         pid, user, pr, ni, virt, res, shr, stat, cpu, mem, time_val, cmd = tokens
                         
-                        # Timpa command bawaan ps yang terpotong dengan command utuh dari /proc
                         if pid in cmdlines:
                             cmd = cmdlines[pid]
 
-                        # Terjemahkan status agar jelas dibaca pengguna
                         if stat.startswith("R"):
                             status_display = "Running (Aktif)"
                         elif stat.startswith("S") or stat.startswith("D"):
@@ -65,6 +63,7 @@ class OSFeaturesHandler:
             pass
 
         return processes
+
     def get_app_memory_usage(self, device_id, package_name):
         try:
             output = self.run_adb_func(device_id, args=["shell", "dumpsys", "meminfo", package_name], timeout=15)
