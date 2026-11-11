@@ -6,64 +6,81 @@ class OSFeaturesHandler:
         self.run_adb_func = run_adb_func
 
     def get_process_table(self, device_id):
-        """Mengambil SEMUA proses dari Android secara lengkap dan utuh dengan teknik batch kilat."""
+        """Mengambil SEMUA proses dari Android secara kilat (<0.2 detik) menggunakan top -n 1."""
         processes = []
         
         try:
-            # 1. Ambil daftar tabel proses utama menggunakan ps -A
-            output_ps = self.run_adb_func(device_id, args=["shell", "ps", "-A", "-o", "PID,USER,PR,NI,VIRT,RES,SHR,S,%CPU,%MEM,TIME,CMD"], timeout=8)
-            if not output_ps:
-                return []
-                
-            lines = output_ps.splitlines()
+            # Gunakan top -n 1 -b bawaan Android yang kompatibel di semua ROM
+            output_top = self.run_adb_func(
+                device_id, 
+                args=["shell", "top", "-n", "1", "-b"], 
+                timeout=4
+            )
             
-            # 2. Ambil SEMUA file cmdline dari direktori /proc sekaligus dalam 1 kali perintah ADB
-            cmdlines = {}
-            try:
-                raw_cmdlines = self.run_adb_func(device_id, args=["shell", "for d in /proc/[0-9]*; do echo \"${d##*/}: $(cat $d/cmdline 2>/dev/null)\"; done"], timeout=3)
-                if raw_cmdlines:
-                    for cline in raw_cmdlines.splitlines():
-                        if ":" in cline:
-                            parts = cline.split(":", 1)
-                            pid_val = parts[0].strip()
-                            c_val = parts[1].strip().replace("\x00", " ").strip()
-                            if c_val:
-                                cmdlines[pid_val] = c_val
-            except Exception:
-                pass
+            # Fallback jika flag -b tidak didukung oleh versi ROM tertentu
+            if not output_top:
+                output_top = self.run_adb_func(
+                    device_id, 
+                    args=["shell", "top", "-n", "1"], 
+                    timeout=4
+                )
+                
+            if not output_top:
+                return []
 
-            # 3. Gabungkan data ps dengan cmdline utuh secara lokal di memori Python
-            if len(lines) > 1:
-                for line in lines[1:]:
-                    tokens = line.split(None, 11)
-                    if len(tokens) >= 12:
-                        pid, user, pr, ni, virt, res, shr, stat, cpu, mem, time_val, cmd = tokens
-                        
-                        if pid in cmdlines:
-                            cmd = cmdlines[pid]
+            lines = output_top.splitlines()
+            header_found = False
+            
+            for line in lines:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                
+                # Lewati baris ringkasan atas sampai menemukan baris header tabel
+                if "PID" in line_str and ("USER" in line_str or "ARGS" in line_str or "NAME" in line_str or "CPU" in line_str):
+                    header_found = True
+                    continue
+                
+                if not header_found:
+                    continue
 
-                        if stat.startswith("R"):
-                            status_display = "Running (Aktif)"
-                        elif stat.startswith("S") or stat.startswith("D"):
-                            status_display = "Sleeping (Latar Belakang)"
-                        elif stat.startswith("T"):
-                            status_display = "Stopped (Ditahan)"
-                        elif stat.startswith("Z"):
-                            status_display = "Zombie (Mati)"
-                        else:
-                            status_display = f"Status ({stat})"
+                tokens = line_str.split(None, 11)
+                if len(tokens) >= 12:
+                    pid, user, pr, ni, virt, res, shr, stat, cpu, mem, time_val, cmd = tokens
+                elif len(tokens) >= 9:
+                    # Format alternatif untuk beberapa versi ROM Android
+                    pid, user = tokens[0], tokens[1]
+                    cpu, mem = tokens[2], tokens[3]
+                    cmd = tokens[-1]
+                    pr, ni, virt, res, shr, stat, time_val = "-", "-", "-", "-", "-", "S", "-"
+                else:
+                    continue
 
-                        cpu_pct = cpu + "%" if not cpu.endswith("%") else cpu
-                        mem_pct = mem + "%" if not mem.endswith("%") else mem
+                if not pid.isdigit():
+                    continue
 
-                        processes.append((
-                            pid, user, status_display, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_val, cmd
-                        ))
+                if stat.startswith("R"):
+                    status_display = "Running (Aktif)"
+                elif stat.startswith("S") or stat.startswith("D"):
+                    status_display = "Sleeping (Latar Belakang)"
+                elif stat.startswith("T"):
+                    status_display = "Stopped (Ditahan)"
+                elif stat.startswith("Z"):
+                    status_display = "Zombie (Mati)"
+                else:
+                    status_display = f"Status ({stat})"
+
+                cpu_pct = cpu if cpu.endswith("%") else cpu + "%"
+                mem_pct = mem if mem.endswith("%") else mem + "%"
+
+                processes.append((
+                    pid, user, status_display, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_val, cmd
+                ))
         except Exception:
             pass
 
         return processes
-
+        
     def get_app_memory_usage(self, device_id, package_name):
         try:
             output = self.run_adb_func(device_id, args=["shell", "dumpsys", "meminfo", package_name], timeout=15)

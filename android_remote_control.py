@@ -4,7 +4,9 @@
 import os
 import subprocess
 import time
+import threading 
 import tkinter as tk
+from queue import Queue
 from datetime import datetime
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -32,6 +34,7 @@ class RemoteControlApp:
         self.session_locked = False
         self.packages = []
         self.recording_process = None
+        self.is_fetching_proc = False
 
         self.prev_rx_bytes = 0
         self.prev_tx_bytes = 0
@@ -173,55 +176,147 @@ class RemoteControlApp:
             pass
 
     def auto_refresh_cpu_loop(self):
+        """Loop auto-refresh yang dijalankan via background thread agar GUI tidak lag."""
         try:
             if hasattr(self, 'notebook'):
                 selected_tab = self.notebook.tab(self.notebook.select(), "text")
                 if selected_tab == "Manajemen Proses & CPU":
-                    self.load_processes(auto=True)
+                    if getattr(self, 'auto_refresh_proc_var', None) and self.auto_refresh_proc_var.get():
+                        if not self.is_fetching_proc:
+                            self.is_fetching_proc = True
+                            threading.Thread(target=self._fetch_processes_worker, daemon=True).start()
                 elif selected_tab == "Monitor Jaringan":
                     self.load_network_traffic()
         except Exception:
             pass
-        self.root.after(1500, self.auto_refresh_cpu_loop)
+        self.root.after(2500, self.auto_refresh_cpu_loop)
+
+    def _fetch_processes_worker(self):
+        """Worker thread khusus mengambil data proses via ADB dengan pengunci aman."""
+        device_id = self.device.get().strip()
+        if device_id:
+            try:
+                raw_processes = self.os_handler.get_process_table(device_id)
+                self.root.after(0, self._smart_update_proc_tree, raw_processes)
+            except Exception as exc:
+                err_msg = str(exc)
+                self.root.after(0, lambda msg=err_msg: self.status.set(f"Gagal memuat proses: {msg}"))
+            finally:
+                # Pastikan flag selalu di-reset agar tombol bisa diklik lagi
+                self.is_fetching_proc = False
+        else:
+            self.is_fetching_proc = False
+        
+    def _smart_update_proc_tree(self, raw_processes):
+        """Memperbarui isi TreeView dengan menempatkan Aplikasi di paling atas."""
+        if not raw_processes:
+            self.status.set("⚠️ ADB mengembalikan data proses kosong.")
+            return
+
+        processed_list = []
+        for proc in raw_processes:
+            if len(proc) >= 12:
+                pid, user, status, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_plus, command = proc
+            else:
+                pid, user, status, ni, cpu_pct, command = proc[:6]
+                pr, virt, res, shr, mem_pct, time_plus = "-", "-", "-", "-", "-", "-"
+            
+            app_label = "Sistem / Layanan Android"
+            pkg_name = "-"
+            
+            clean_token = command.strip("()[]{}")
+            if "." in clean_token and not clean_token.startswith("/") and not clean_token.startswith("0:"):
+                parts_dot = clean_token.split(".")
+                if len(parts_dot) >= 2 and not all(p.isdigit() for p in parts_dot):
+                    pkg_name = clean_token
+                    app_label = self.extract_app_name(pkg_name)
+
+            # Hitung nilai CPU float untuk pengurutan
+            try:
+                cpu_float = float(str(cpu_pct).replace("%", "").strip())
+            except ValueError:
+                cpu_float = 0.0
+
+            # Priority 0: Aplikasi Pengguna (terdeteksi package name)
+            # Priority 1: Layanan / Sistem Android
+            is_app = (pkg_name != "-")
+            priority = 0 if is_app else 1
+
+            vals = (pid, user, status, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_plus, app_label, command)
+            processed_list.append({
+                "pid_str": str(pid),
+                "vals": vals,
+                "priority": priority,
+                "cpu_float": cpu_float
+            })
+
+        # Urutkan: Aplikasi Pengguna paling atas (priority 0), lalu diurutkan dari CPU terbesar
+        processed_list.sort(key=lambda x: (x["priority"], -x["cpu_float"]))
+
+        existing_items = {}
+        for item in self.proc_tree.get_children():
+            item_vals = self.proc_tree.item(item, "values")
+            if item_vals:
+                existing_items[str(item_vals[0])] = item
+
+        new_pids = set()
+        for idx, item_data in enumerate(processed_list):
+            pid_str = item_data["pid_str"]
+            vals = item_data["vals"]
+            new_pids.add(pid_str)
+
+            if pid_str in existing_items:
+                item_id = existing_items[pid_str]
+                if self.proc_tree.item(item_id, "values") != vals:
+                    self.proc_tree.item(item_id, values=vals)
+                # Pindahkan posisi baris agar sesuai urutan prioritas terbaru
+                self.proc_tree.move(item_id, "", idx)
+            else:
+                self.proc_tree.insert("", idx, values=vals)
+
+        # Hapus proses yang sudah mati / tidak aktif
+        for pid_str, item_id in existing_items.items():
+            if pid_str not in new_pids:
+                self.proc_tree.delete(item_id)
+
+        self.status.set(f"Berhasil memuat {len(processed_list)} proses (Aplikasi diprioritaskan di atas).")
+        
 
     def _get_active_network_state(self):
-        """Logika ketat pembeda Wi-Fi vs Paket Data (Telkomsel) secara real-time."""
+        """Logika deteksi Wi-Fi Client vs Paket Data Seluler (Mengabaikan Nama Hotspot HP)."""
         wifi_active = False
         data_active = False
         wifi_ssid = "-"
         
         try:
-            # 1. Cek apakah Wi-Fi secara hardware/software benar-benar aktif & terhubung ke router
-            wifi_dump = self.run_adb_local(["shell", "dumpsys", "wifi"], timeout=3)
-            is_wifi_enabled = "Wi-Fi is enabled" in wifi_dump or "mWifiState=WIFI_STATE_ENABLED" in wifi_dump or "Enabled: true" in wifi_dump
-            is_wifi_connected = "mNetworkInfo [type: WIFI" in wifi_dump and "CONNECTED" in wifi_dump
-
-            # 2. Cek routing interface aktif di linux kernel android (`ip route`)
+            wifi_dump = self.run_adb_local(["shell", "dumpsys", "wifi"], timeout=4)
             route_out = self.run_adb_local(["shell", "ip", "route"], timeout=3)
-            has_wlan_route = "wlan0" in route_out
-            has_cellular_route = any(c in route_out for c in ["rmnet", "ccmni", "wwan", "pdp"])
-
-            # Prioritas 1: Wi-Fi (Hanya dianggap aktif jika Wi-Fi nyala DAN benar-benar terhubung ke access point/route wlan0)
-            if is_wifi_enabled and is_wifi_connected and has_wlan_route:
-                wifi_active = True
-                try:
-                    for line in wifi_dump.splitlines():
-                        if "SSID:" in line:
-                            wifi_ssid = line.split("SSID:")[1].split(",")[0].strip('"\' ')
+            
+            # 1. Cek rute interface wlan pada kernel Linux Android
+            has_wlan_route = "wlan0" in route_out or "wlan1" in route_out
+            
+            # 2. Ambil SSID HANYA jika HP bertindak sebagai Klien Wi-Fi (bukan SoftAP/Hotspot)
+            for line in wifi_dump.splitlines():
+                # Filter khusus mWifiInfo (informasi koneksi Wi-Fi yang sedang tersambung)
+                if "mWifiInfo" in line and "SSID:" in line:
+                    parts = line.split("SSID:")
+                    if len(parts) > 1:
+                        candidate = parts[1].split(",")[0].split("BSSID:")[0].strip('"\' ')
+                        if candidate and candidate not in ["<unknown ssid>", "-", "null"]:
+                            wifi_ssid = candidate
                             break
-                    if not wifi_ssid or wifi_ssid == "-":
-                        wifi_ssid = "Terhubung (Aktif)"
-                except Exception:
-                    wifi_ssid = "Terhubung (Aktif)"
+
+            # 3. Wi-Fi hanya dianggap aktif jika ada rute wlan0/wlan1 DAN tersambung ke router
+            if has_wlan_route and wifi_ssid != "-":
+                wifi_active = True
             else:
-                # Prioritas 2: Paket Data Seluler (Telkomsel)
-                if has_cellular_route or not wifi_active:
-                    data_active = True
+                wifi_ssid = "-"
+                data_active = True
+
         except Exception:
-            data_active = True  # Fallback aman ke data seluler jika gagal baca dumpsys
+            data_active = True
 
         return wifi_active, wifi_ssid, data_active
-
     def load_network_traffic(self):
         try:
             device_id = self.device.get().strip()
@@ -279,7 +374,7 @@ class RemoteControlApp:
                 self.net_main_status.set("Wi-Fi (Aktif & Diprioritaskan)")
                 self.net_wifi_name.set(wifi_ssid_val)
             elif data_on:
-                self.net_main_status.set("Paket Data Seluler / Telkomsel (Aktif Digunakan)")
+                self.net_main_status.set("Paket Data Seluler")
                 self.net_wifi_name.set("Mati / Tidak Terhubung")
             else:
                 self.net_main_status.set("Tidak Ada Koneksi Aktif")
@@ -304,36 +399,50 @@ class RemoteControlApp:
 
             # Deteksi Hotspot & Sumber Jaringannya secara Akurat
             clients_list = []
+            is_hotspot_on = False
+            
             try:
-                wifi_state_out = self.run_adb_local(["shell", "dumpsys", "wifi"], timeout=3)
-                is_hotspot_on = "SoftAp state: 13" in wifi_state_out or "mHotspotEnabled = true" in wifi_state_out or "AP state: 3" in wifi_state_out
+                # 1. Cek tabel rute IP (Hotspot Android selalu membuat subnet lokal seperti 192.168.43.x atau 192.168.50.x)
+                route_out = self.run_adb_local(["shell", "ip", "route"], timeout=3)
                 
+                # Hotspot dianggap AKTIF HANYA JIKA antarmuka ap/swlan/wlan1 dalam status UP dengan rute subnet aktif
+                for line in route_out.splitlines():
+                    if any(iface in line for iface in ["ap0", "wlan1", "softap", "swlan0"]) and "dev" in line:
+                        is_hotspot_on = True
+                        break
+
+                # 2. Backup check via perintah connectivity tethering
                 if not is_hotspot_on:
-                    iface_out = self.run_adb_local(["shell", "ip", "link"], timeout=2)
-                    is_hotspot_on = any(k in iface_out for k in ["ap0", "swlan0", "rndis0"])
+                    tether_out = self.run_adb_local(["shell", "dumpsys", "connectivity"], timeout=3)
+                    if "tetheringClasses" in tether_out or "tethered" in tether_out.lower():
+                        for tline in tether_out.splitlines():
+                            if "tethered:" in tline.lower() and any(k in tline for k in ["ap0", "wlan1", "swlan0"]):
+                                is_hotspot_on = True
+                                break
 
                 if is_hotspot_on:
                     self.net_hotspot_status.set("🟢 Nyala (Aktif)")
                     if wifi_on:
                         self.net_hotspot_source.set(f"Wi-Fi ({wifi_ssid_val}) — Meneruskan koneksi Wi-Fi")
                     else:
-                        self.net_hotspot_source.set("Paket Data Seluler (Telkomsel) — Meneruskan kuota seluler")
+                        self.net_hotspot_source.set("Paket Data Seluler — Meneruskan kuota seluler")
 
+                    # Baca daftar klien terhubung dari tabel ARP
                     arp_out = self.run_adb_local(["shell", "cat", "/proc/net/arp"], timeout=3)
                     for aline in arp_out.splitlines():
                         parts = aline.split()
                         if len(parts) >= 4 and parts[0] != "IP":
                             ip_addr = parts[0]
                             mac_addr = parts[3]
-                            if mac_addr != "00:00:00:00:00:00":
+                            if mac_addr != "00:00:00:00:00:00" and not ip_addr.startswith("10."):
                                 clients_list.append((ip_addr, mac_addr))
                 else:
                     self.net_hotspot_status.set("🔴 Mati (Tidak Aktif)")
                     self.net_hotspot_source.set("Tidak Ada (Hotspot Sedang Dimatikan)")
+
             except Exception:
                 self.net_hotspot_status.set("🔴 Mati (Tidak Aktif)")
                 self.net_hotspot_source.set("Tidak Ada (Hotspot Sedang Dimatikan)")
-
             for item in self.client_tree.get_children():
                 self.client_tree.delete(item)
 
@@ -365,15 +474,15 @@ class RemoteControlApp:
 
     def toggle_data_connection(self):
         try:
-            state = simpledialog.askstring("Kontrol Paket Data", "Ketik 'on' untuk menyalakan atau 'off' untuk mematikan Paket Data Telkomsel:", parent=self.root)
+            state = simpledialog.askstring("Kontrol Paket Data", "Ketik 'on' untuk menyalakan atau 'off' untuk mematikan Paket Data:", parent=self.root)
             if state:
                 val = state.strip().lower()
                 if val == 'on':
                     self.run_adb_local(["shell", "svc", "data", "enable"], timeout=5)
-                    messagebox.showinfo("Berhasil", "Perintah menyalakan Paket Data Telkomsel dikirim.", parent=self.root)
+                    messagebox.showinfo("Berhasil", "Perintah menyalakan Paket Data dikirim.", parent=self.root)
                 elif val == 'off':
                     self.run_adb_local(["shell", "svc", "data", "disable"], timeout=5)
-                    messagebox.showinfo("Berhasil", "Perintah mematikan Paket Data Telkomsel dikirim.", parent=self.root)
+                    messagebox.showinfo("Berhasil", "Perintah mematikan Paket Data dikirim.", parent=self.root)
                 self.load_network_traffic()
                 self.refresh_dashboard()
         except Exception as exc:
@@ -394,21 +503,123 @@ class RemoteControlApp:
             self.show_error("Gagal mengubah Mode Pesawat", exc)
 
     def toggle_hotspot_connection(self):
+        """Menyalakan/mematikan Hotspot via ADB atau membuka Halaman Tethering HP secara otomatis."""
         try:
-            state = simpledialog.askstring("Kontrol Hotspot", "Ketik 'on' untuk menyalakan atau 'off' untuk mematikan Hotspot:", parent=self.root)
-            if state:
-                val = state.strip().lower()
-                if val == 'off':
-                    self.run_adb_local(["shell", "cmd", "connectivity", "tether", "stop"], timeout=5)
-                    messagebox.showinfo("Berhasil", "Perintah mematikan hotspot dikirim.", parent=self.root)
-                elif val == 'on':
-                    messagebox.showinfo("Info", "Untuk alasan keamanan sistem, aktifkan hotspot melalui tombol pintasan cepat di layar HP Anda.", parent=self.root)
-                self.load_network_traffic()
-                self.refresh_dashboard()
+            state = simpledialog.askstring(
+                "Kontrol Hotspot", 
+                "Ketik 'on' untuk menyalakan, 'off' untuk mematikan, atau 'open' untuk membuka menu di HP:", 
+                parent=self.root
+            )
+            if not state:
+                return
+
+            val = state.strip().lower()
+            success = False
+
+            if val == 'on':
+                # 1. Coba aktifkan langsung di background (Android Stock/AOSP)
+                try:
+                    out = self.run_adb_local(["shell", "cmd", "tethering", "startTethering", "0"], timeout=4)
+                    if "Error" not in out and "Exception" not in out and "Permission" not in out:
+                        success = True
+                except Exception:
+                    pass
+
+                # 2. Jika diblokir OS HP, buka langsung Halaman TetherSettings di HP
+                if not success:
+                    try:
+                        self.run_adb_local(["shell", "am", "start", "-a", "android.settings.TetherSettings"], timeout=4)
+                        messagebox.showinfo(
+                            "Fitur Keamanan OS HP", 
+                            "Sistem ROM HP Anda memblokir aktifasi Hotspot tersembunyi via ADB.\n\n"
+                            "Halaman 'Pengaturan Hotspot' telah otomatis dibuka di layar HP Anda. Silakan geser tombol sakelar Hotspot.", 
+                            parent=self.root
+                        )
+                    except Exception as exc:
+                        self.show_error("Gagal membuka menu Hotspot", exc)
+                else:
+                    messagebox.showinfo("Berhasil", "Perintah menyalakan Hotspot dikirim.", parent=self.root)
+
+            elif val == 'off':
+                # Coba matikan di background
+                try:
+                    out = self.run_adb_local(["shell", "cmd", "tethering", "stopTethering", "0"], timeout=4)
+                    if "Error" not in out and "Exception" not in out:
+                        success = True
+                except Exception:
+                    pass
+
+                if not success:
+                    try:
+                        self.run_adb_local(["shell", "am", "start", "-a", "android.settings.TetherSettings"], timeout=4)
+                    except Exception:
+                        pass
+                    messagebox.showinfo("Buka Pengaturan", "Silakan matikan sakelar Hotspot pada layar HP yang telah dibuka.", parent=self.root)
+                else:
+                    messagebox.showinfo("Berhasil", "Hotspot dimatikan.", parent=self.root)
+
+            elif val == 'open':
+                self.run_adb_local(["shell", "am", "start", "-a", "android.settings.TetherSettings"], timeout=4)
+                self.status.set("Halaman Pengaturan Hotspot dibuka di HP.")
+
+            self.load_network_traffic()
+            self.refresh_dashboard()
+
         except Exception as exc:
             self.show_error("Gagal mengatur hotspot", exc)
+            
+
+    def load_memory_packages_list(self):
+        """Memuat daftar aplikasi ke tabel Manajemen Memori secara asynchronous (background thread)."""
+        device_id = self.device.get().strip()
+        if not device_id:
+            messagebox.showwarning("Perangkat Belum Dipilih", "Pilih HP yang terhubung terlebih dahulu.", parent=self.root)
+            return
+
+        self.status.set("Memuat daftar aplikasi untuk Manajemen Memori...")
+        self.root.update()
+
+        # Jalankan query ADB di background thread agar UI tidak freeze
+        threading.Thread(target=self._fetch_memory_packages_worker, args=(device_id,), daemon=True).start()
+
+    def _fetch_memory_packages_worker(self, device_id):
+        """Worker thread untuk mengambil daftar package pihak ketiga."""
+        try:
+            # UBAH self.run_adb_cmd MENJADI self.run_adb
+            output = self.run_adb(device_id, args=["shell", "pm", "list", "packages", "-3"], timeout=20)
+            packages = []
+            for line in output.splitlines():
+                line_clean = line.strip().replace("\r", "")
+                if line_clean.startswith("package:"):
+                    pkg = line_clean.replace("package:", "").strip()
+                    if pkg:
+                        packages.append(pkg)
+        
+            app_list = []
+            for pkg in packages:
+                app_name = self.extract_app_name(pkg)
+                app_list.append((app_name, pkg))
+
+            app_list.sort(key=lambda x: x[0].lower())
+
+            # Kirim data kembali ke main thread
+            self.root.after(0, self._populate_memory_tree_ui, app_list)
+        except Exception as exc:
+            err_msg = str(exc)
+            self.root.after(0, self.show_error, "Gagal memuat daftar aplikasi", err_msg)
+
+    def _populate_memory_tree_ui(self, app_list):
+        """Memperbarui TreeView pada main thread setelah data siap."""
+        for item in self.mem_tree.get_children():
+            self.mem_tree.delete(item)
+
+        for app_name, pkg in app_list:
+            self.mem_tree.insert("", "end", values=(app_name, pkg))
+
+        self.status.set(f"Berhasil memuat {len(app_list)} aplikasi pada Manajemen Memori.")
 
     def load_memory_details_for_selected(self):
+        """Mengambil rincian RAM (PSS/RSS/Swap) dan Data Eksternal untuk aplikasi yang dipilih."""
         selected_item = self.mem_tree.selection()
         if not selected_item:
             messagebox.showinfo("Pilih Aplikasi", "Pilih salah satu aplikasi dari tabel terlebih dahulu.", parent=self.root)
@@ -418,9 +629,13 @@ class RemoteControlApp:
         app_name = item_data[0]
         pkg_name = item_data[1]
         
-        self.status.set(f"Mengambil data RAM aktif untuk {app_name}...")
-        self.root.update()
+        self.status.set(f"Mengambil data RAM & Storage untuk {app_name}...")
+        
+        # Jalankan pemanggilan ADB di thread terpisah
+        threading.Thread(target=self._fetch_memory_details_worker, args=(app_name, pkg_name), daemon=True).start()
 
+    def _fetch_memory_details_worker(self, app_name, pkg_name):
+        """Worker thread fleksibel & andal untuk dumpsys meminfo dan storage eksternal."""
         try:
             mem_output = self.run_adb_local(["shell", "dumpsys", "meminfo", pkg_name], timeout=10)
             
@@ -428,50 +643,67 @@ class RemoteControlApp:
             total_pss, total_rss, swap_pss = "0 KB", "0 KB", "0 KB"
             has_active_process = False
 
-            for line in mem_output.splitlines():
-                line_str = line.strip()
-                parts = line_str.split()
-                
-                if line_str.startswith("Native Heap") and len(parts) >= 2:
-                    for p in parts[1:]:
-                        clean_p = ''.join(filter(str.isdigit, p))
-                        if clean_p:
-                            native_heap = f"{clean_p} KB"
-                            if int(clean_p) > 0:
+            if "No process found" in mem_output or not mem_output.strip():
+                has_active_process = False
+            else:
+                for line in mem_output.splitlines():
+                    line_str = line.strip()
+                    
+                    if "Native Heap" in line_str:
+                        for token in line_str.split():
+                            clean_val = ''.join(filter(str.isdigit, token))
+                            if clean_val and int(clean_val) > 0:
+                                native_heap = f"{int(clean_val):,} KB".replace(",", ".")
                                 has_active_process = True
-                            break
-                elif line_str.startswith("Dalvik Heap") and len(parts) >= 2:
-                    for p in parts[1:]:
-                        clean_p = ''.join(filter(str.isdigit, p))
-                        if clean_p:
-                            dalvik_heap = f"{clean_p} KB"
-                            if int(clean_p) > 0:
-                                has_active_process = True
-                            break
-                elif line_str.startswith("Graphics:") and len(parts) >= 2:
-                    for p in parts[1:]:
-                        clean_p = ''.join(filter(str.isdigit, p))
-                        if clean_p:
-                            graphics = f"{clean_p} KB"
-                            break
-                elif line_str.startswith("TOTAL PSS:") and len(parts) >= 3:
-                    clean_p = ''.join(filter(str.isdigit, parts[2]))
-                    if clean_p:
-                        total_pss = f"{clean_p} KB"
-                        if int(clean_p) > 0:
-                            has_active_process = True
-                elif line_str.startswith("TOTAL RSS:") and len(parts) >= 3:
-                    clean_p = ''.join(filter(str.isdigit, parts[2]))
-                    if clean_p:
-                        total_rss = f"{clean_p} KB"
-                elif "TOTAL SWAP PSS:" in line_str or "SWAP PSS:" in line_str:
-                    for p in parts:
-                        clean_p = ''.join(filter(str.isdigit, p))
-                        if clean_p and int(clean_p) > 0:
-                            swap_pss = f"{clean_p} KB"
-                            break
+                                break
 
-            data_eksternal = "0 KB"
+                    elif "Dalvik Heap" in line_str:
+                        for token in line_str.split():
+                            clean_val = ''.join(filter(str.isdigit, token))
+                            if clean_val and int(clean_val) > 0:
+                                dalvik_heap = f"{int(clean_val):,} KB".replace(",", ".")
+                                has_active_process = True
+                                break
+
+                    elif "Graphics:" in line_str or "Graphics" in line_str:
+                        for token in line_str.split():
+                            clean_val = ''.join(filter(str.isdigit, token))
+                            if clean_val and int(clean_val) > 0:
+                                graphics = f"{int(clean_val):,} KB".replace(",", ".")
+                                break
+
+                    if "TOTAL PSS:" in line_str or "TOTAL PSS" in line_str or line_str.startswith("TOTAL:"):
+                        parts = line_str.split()
+                        for idx, token in enumerate(parts):
+                            clean_token = token.rstrip(":")
+                            if clean_token in ["PSS", "TOTAL"] and idx + 1 < len(parts):
+                                clean_val = ''.join(filter(str.isdigit, parts[idx + 1]))
+                                if clean_val and int(clean_val) > 0:
+                                    total_pss = f"{int(clean_val):,} KB".replace(",", ".")
+                                    has_active_process = True
+                                    break
+
+                    if "TOTAL RSS:" in line_str or "TOTAL RSS" in line_str or "RSS:" in line_str:
+                        parts = line_str.split()
+                        for idx, token in enumerate(parts):
+                            if token.rstrip(":") == "RSS" and idx + 1 < len(parts):
+                                clean_val = ''.join(filter(str.isdigit, parts[idx + 1]))
+                                if clean_val:
+                                    total_rss = f"{int(clean_val):,} KB".replace(",", ".")
+                                    break
+
+                    if "SWAP" in line_str:
+                        parts = line_str.split()
+                        for idx, token in enumerate(parts):
+                            if "SWAP" in token and idx + 1 < len(parts):
+                                next_token = parts[idx + 1].rstrip(":")
+                                target_idx = idx + 2 if next_token == "PSS" and idx + 2 < len(parts) else idx + 1
+                                clean_val = ''.join(filter(str.isdigit, parts[target_idx]))
+                                if clean_val:
+                                    swap_pss = f"{int(clean_val):,} KB".replace(",", ".")
+                                    break
+
+            data_eksternal = "0 KB / Dibatasi OS"
             try:
                 ext_out = self.run_adb_local(["shell", "du", "-sh", f"/sdcard/Android/data/{pkg_name}"], timeout=5)
                 if ext_out and "No such" not in ext_out and "denied" not in ext_out.lower():
@@ -480,86 +712,34 @@ class RemoteControlApp:
                 pass
 
             detail_text = f"===========================================================\n"
-            detail_text += f" ANALISIS MEMORI & STORAGE: {app_name}\n"
+            detail_text += f" ANALISIS MEMORI & STORAGE EKSTERNAL: {app_name}\n"
             detail_text += f" Package: {pkg_name}\n"
             detail_text += f"===========================================================\n\n"
             
             if not has_active_process:
-                detail_text += f"⚠️ STATUS RAM: Aplikasi sedang tidak digunakan / tidak aktif di RAM.\n\n"
+                detail_text += f"⚠️ STATUS RAM: Aplikasi sedang tidak aktif / terhenti di RAM.\n\n"
             else:
-                detail_text += f"🧠 RINCIAN PENGGUNAAN RAM:\n\n"
-                detail_text += f"+-------------------+-------------------+--------------------------------------------------+\n"
-                detail_text += f"| Komponen Memori   | Besar Angka       | Penjelasan (Arti & Fungsinya)                    |\n"
-                detail_text += f"+-------------------+-------------------+--------------------------------------------------+\n"
-                detail_text += f"| Native Heap       | {native_heap:<17} | Memori untuk sistem inti & bahasa C/C++          |\n"
-                detail_text += f"| Dalvik Heap       | {dalvik_heap:<17} | Memori bahasa pemrograman aplikasi (Java/Kotlin) |\n"
-                detail_text += f"| Graphics          | {graphics:<17} | Memori khusus untuk memproses tampilan visual    |\n"
-                detail_text += f"| TOTAL PSS         | {total_pss:<17} | Total memori RAM fisik nyata yang sedang dipakai |\n"
-                detail_text += f"| TOTAL RSS         | {total_rss:<17} | Total keseluruhan memori termasuk memori bersama |\n"
-                detail_text += f"| SWAP PSS          | {swap_pss:<17} | Data dipindah ke memori virtual agar RAM longgar |\n"
-                detail_text += f"+-------------------+-------------------+--------------------------------------------------+\n"
+                detail_text += f"🧠 RINCIAN PENGGUNAAN MEMORI RAM:\n"
+                detail_text += f" • Native Heap  : {native_heap}\n"
+                detail_text += f" • Dalvik Heap  : {dalvik_heap}\n"
+                detail_text += f" • Graphics     : {graphics}\n"
+                detail_text += f" • TOTAL PSS    : {total_pss} (RAM fisik terpakai)\n"
+                detail_text += f" • TOTAL RSS    : {total_rss} (Termasuk shared memory)\n"
+                detail_text += f" • SWAP PSS     : {swap_pss} (Memori virtual)\n\n"
 
-            detail_text += f"📁 RINCIAN PENGGUNAAN STORAGE (DATA & CACHE):\n\n"
-            detail_text += f"+-------------------+--------------------------------------------------+\n"
-            detail_text += f"| Data & Cache Eks. | {data_eksternal:<48} |\n"
-            detail_text += f"+-------------------+--------------------------------------------------+\n"
+            detail_text += f"📁 STORAGE EKSTERNAL (/sdcard/Android/data):\n"
+            detail_text += f" • Ukuran Data  : {data_eksternal}\n"
 
-            self.mem_detail_box.delete("1.0", tk.END)
-            self.mem_detail_box.insert(tk.END, detail_text)
-            self.status.set(f"Berhasil memuat analisis memori untuk {app_name}.")
+            self.root.after(0, self._render_memory_detail_text, detail_text, app_name)
+
         except Exception as exc:
-            self.show_error("Gagal Memuat Detail Memori", exc)
-
-    def load_memory_packages_list(self):
-        try:
-            self.status.set("Memuat daftar aplikasi dari HP...")
-            self.root.update()
-
-            output = self.run_adb_local(["shell", "pm", "list", "packages", "-3"], timeout=30)
-            packages = []
-            for line in output.splitlines():
-                line_clean = line.strip().replace("\r", "")
-                if line_clean.startswith("package:"):
-                    pkg_name = line_clean.replace("package:", "").strip()
-                    if pkg_name:
-                        packages.append(pkg_name)
-            
-            app_list = []
-            for pkg in packages:
-                app_name = "Tidak diketahui"
-                try:
-                    pkg_info = self.run_adb_local(["shell", "dumpsys", "package", pkg], timeout=4)
-                    for line in pkg_info.splitlines():
-                        if "applicationInfo" in line and "label=" in line:
-                            val = line.split("label=")[1].strip()
-                            if val.startswith("'") or val.startswith('"'):
-                                quote = val[0]
-                                end_idx = val.find(quote, 1)
-                                if end_idx != -1:
-                                    app_name = val[1:end_idx]
-                            else:
-                                app_name = val.split()[0].strip("'\"")
-                            break
-                except Exception:
-                    pass
-
-                if app_name == "Tidak diketahui" or not app_name:
-                    app_name = self.extract_app_name(pkg)
-
-                app_list.append((app_name, pkg))
-
-            app_list.sort(key=lambda x: x[0].lower())
-
-            for item in self.mem_tree.get_children():
-                self.mem_tree.delete(item)
-
-            for app_name, pkg in app_list:
-                self.mem_tree.insert("", "end", values=(app_name, pkg))
-
-            self.status.set(f"Berhasil memuat {len(app_list)} aplikasi dari HP.")
-        except Exception as exc:
-            self.show_error("Gagal memuat aplikasi", exc)
-
+            err_msg = str(exc)
+            self.root.after(0, self.show_error, "Gagal Memuat Detail Memori", err_msg)            
+    def _render_memory_detail_text(self, detail_text, app_name):
+        self.mem_detail_box.delete("1.0", tk.END)
+        self.mem_detail_box.insert(tk.END, detail_text)
+        self.status.set(f"Berhasil memuat analisis memori untuk {app_name}.")
+        
     def load_uptime(self):
         try:
             device_id = self.device.get().strip()
@@ -595,109 +775,14 @@ class RemoteControlApp:
             self.show_error("Gagal memuat uptime", exc)
 
     def load_processes(self, auto=False):
-        try:
-            device_id = self.device.get().strip()
-            if not device_id:
-                return
-
-            if not auto:
-                self.status.set("Mengambil dan menyusun ulang daftar proses...")
-                self.root.update()
-
-            raw_processes = self.os_handler.get_process_table(device_id)
+        """Manual refresh saat tombol diklik."""
+        if not auto:
+            self.status.set("Mengambil daftar proses...")
+        device_id = self.device.get().strip()
+        if device_id and not self.is_fetching_proc:
+            self.is_fetching_proc = True
+            threading.Thread(target=self._fetch_processes_worker, daemon=True).start()
             
-            selected_pids = []
-            for item in self.proc_tree.selection():
-                vals = self.proc_tree.item(item).get('values')
-                if vals:
-                    selected_pids.append(str(vals[0]))
-            
-            processed_list = []
-            
-            for proc in raw_processes:
-                if len(proc) >= 12:
-                    pid, user, status, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_plus, command = proc
-                else:
-                    pid, user, status, ni, cpu_pct, command = proc[:6]
-                    pr, virt, res, shr, mem_pct, time_plus = "-", "-", "-", "-", "-", "-"
-                
-                app_label = "Sistem / Layanan Android"
-                pkg_name = "-"
-                real_cpu_float = 0.0
-                real_cmd = command
-                
-                try:
-                    real_cpu_float = float(cpu_pct.replace('%', ''))
-                except ValueError:
-                    pass
-
-                clean_token = command.strip("()[]{}")
-                
-                if clean_token.startswith("stagram.") or clean_token == "stagram":
-                    clean_token = "com.instagram.android"
-                elif clean_token.startswith("oid.apps.photos"):
-                    clean_token = "com.google.android.apps.photos"
-                elif clean_token.startswith("wp.wattpad"):
-                    clean_token = "com.wattpad.app"
-                elif clean_token.startswith("ndroid.systemui"):
-                    clean_token = "com.android.systemui"
-
-                if "." in clean_token and not clean_token.startswith("/") and not clean_token.startswith("0:") and not clean_token.startswith("top"):
-                    parts_dot = clean_token.split(".")
-                    if len(parts_dot) >= 2 and not all(p.isdigit() for p in parts_dot):
-                        pkg_name = clean_token
-                        app_name_raw = self.extract_app_name(pkg_name)
-                        app_label = f"{app_name_raw}" 
-
-                is_special_system = False
-                if pkg_name == "-":
-                    if "kworker" in real_cmd:
-                        app_label = "Kernel Worker (Latar Belakang)"
-                        is_special_system = True
-                    elif "surfaceflinger" in real_cmd:
-                        app_label = "SurfaceFlinger (Layar Grafis)"
-                        is_special_system = True
-                    elif "system_server" in real_cmd:
-                        app_label = "System Server (Utama Android)"
-                        is_special_system = True
-                    elif "zygote" in real_cmd:
-                        app_label = "Zygote (Inkubator Proses)"
-                        is_special_system = True
-                    elif "logd" in real_cmd:
-                        app_label = "Log Daemon (Pencatat Sistem)"
-                        is_special_system = True
-
-                if pkg_name != "-" and real_cpu_float > 0.0:
-                    priority = 1
-                elif is_special_system:
-                    priority = 2
-                elif pkg_name != "-" and real_cpu_float == 0.0:
-                    priority = 3
-                else:
-                    priority = 4
-
-                processed_list.append({
-                    "values": (pid, user, status, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_plus, app_label, command),
-                    "priority": priority,
-                    "cpu_float": real_cpu_float
-                })
-
-            processed_list.sort(key=lambda x: (x["priority"], -x["cpu_float"]))
-
-            for item in self.proc_tree.get_children():
-                self.proc_tree.delete(item)
-
-            for p in processed_list:
-                new_item = self.proc_tree.insert("", "end", values=p["values"])
-                if str(p["values"][0]) in selected_pids:
-                    self.proc_tree.selection_set(new_item)
-
-            if not auto:
-                self.status.set(f"Berhasil memuat {len(raw_processes)} proses dari perangkat.")
-        except Exception as exc:
-            if not auto:
-                self.status.set(f"Gagal memuat proses: {str(exc)}")
-
     def change_process_priority(self):
         selected_item = self.proc_tree.selection()
         if not selected_item:
@@ -837,7 +922,7 @@ class RemoteControlApp:
             if wifi_is_on:
                 net_status = f"Terhubung ke Wi-Fi ({ssid_name}) — (Prioritas Utama)"
             elif data_is_on:
-                net_status = "Terhubung ke Paket Data Seluler / Telkomsel (Aktif Digunakan)"
+                net_status = "Terhubung ke Paket Data Seluler"
             else:
                 net_status = "Tidak Ada Koneksi Internet Aktif"
 
@@ -1205,8 +1290,6 @@ class RemoteControlApp:
         ttk.Button(net_top, text="🔄 Refresh Traffic", command=self.load_network_traffic).pack(side="left")
         ttk.Button(net_top, text="📶 Toggle Wi-Fi (On/Off)", command=self.toggle_wifi_connection).pack(side="left", padx=4)
         ttk.Button(net_top, text="📡 Toggle Data (On/Off)", command=self.toggle_data_connection).pack(side="left", padx=4)
-        ttk.Button(net_top, text="✈️ Toggle Mode Pesawat", command=self.toggle_airplane_mode).pack(side="left", padx=4)
-        ttk.Button(net_top, text="🛑 Matikan Hotspot", command=self.toggle_hotspot_connection).pack(side="left", padx=4)
 
         net_content_frame = ttk.Frame(network_tab)
         net_content_frame.pack(fill="both", expand=True, pady=6)
@@ -1233,7 +1316,7 @@ class RemoteControlApp:
             ("Kecepatan Download (Rx):", self.net_speed_dl),
             ("Kecepatan Upload (Tx):", self.net_speed_ul),
             ("Kuota Wi-Fi Terpakai:", self.net_wifi_quota),
-            ("Kuota Paket Data Telkomsel:", self.net_mobile_quota),
+            ("Kuota Paket Data:", self.net_mobile_quota),
             ("Total Keseluruhan Kuota:", self.net_total_quota)
         ]:
             row = ttk.Frame(card_stats)
@@ -1351,11 +1434,57 @@ class RemoteControlApp:
         self.st_text.pack(side="left", fill="both", expand=True)
         st_scroll.config(command=self.st_text.yview)
 
+        # ==================== TAB MANAJEMEN MEMORI ====================
+        mem_top = ttk.Frame(mem_tab)
+        mem_top.pack(fill="x", pady=6)
+        ttk.Button(mem_top, text="🔄 Refresh Daftar Aplikasi", command=self.load_memory_packages_list).pack(side="left")
+        ttk.Button(mem_top, text="📊 Analisis Memori Terpilih", command=self.load_memory_details_for_selected).pack(side="left", padx=8)
+
+        mem_container = ttk.Frame(mem_tab)
+        mem_container.pack(fill="both", expand=True, pady=4)
+
+        # Panel Kiri: Tabel Aplikasi (mem_tree)
+        left_frame = ttk.LabelFrame(mem_container, text="Daftar Aplikasi Pihak Ketiga", padding=8)
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
+
+        self.mem_tree = ttk.Treeview(
+            left_frame,
+            columns=("Nama Aplikasi", "Nama Paket (Package)"),
+            show="headings",
+            height=20
+        )
+        self.mem_tree.heading("Nama Aplikasi", text="Nama Aplikasi")
+        self.mem_tree.heading("Nama Paket (Package)", text="Package Name")
+        self.mem_tree.column("Nama Aplikasi", width=180, anchor="w")
+        self.mem_tree.column("Nama Paket (Package)", width=220, anchor="w")
+        self.mem_tree.bind("<ButtonRelease-1>", self.on_mem_tree_click)
+
+        mem_scroll = ttk.Scrollbar(left_frame, orient="vertical", command=self.mem_tree.yview)
+        self.mem_tree.configure(yscrollcommand=mem_scroll.set)
+        self.mem_tree.pack(side="left", fill="both", expand=True)
+        mem_scroll.pack(side="right", fill="y")
+
+        # Panel Kanan: Detail Memori & Storage (mem_detail_box)
+        right_frame = ttk.LabelFrame(mem_container, text="Detail Analisis Memori & Storage", padding=8)
+        right_frame.pack(side="right", fill="both", expand=True, padx=(4, 0))
+
+        detail_scroll = ttk.Scrollbar(right_frame, orient="vertical")
+        detail_scroll.pack(side="right", fill="y")
+
+        self.mem_detail_box = tk.Text(
+            right_frame, wrap="word", bg="#121212", fg="#FFFFFF",
+            font=("DejaVu Sans Mono", 9), yscrollcommand=detail_scroll.set
+        )
+        self.mem_detail_box.pack(side="left", fill="both", expand=True)
+        detail_scroll.config(command=self.mem_detail_box.yview)
+
         # ==================== TAB MANAJEMEN PROSES & CPU ====================
         proc_top = ttk.Frame(process_tab)
         proc_top.pack(fill="x", pady=6)
         ttk.Button(proc_top, text="🔄 Muat Ulang Real-Time", command=self.load_processes).pack(side="left")
         ttk.Button(proc_top, text="⚙️ Ubah Prioritas (Renice)", command=self.change_process_priority).pack(side="left", padx=8)
+        self.auto_refresh_proc_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(proc_top, text="Auto Refresh (1.5s)", variable=self.auto_refresh_proc_var).pack(side="left", padx=12)
 
         tree_frame = ttk.Frame(process_tab)
         tree_frame.pack(fill="both", expand=True, pady=4)
