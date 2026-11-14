@@ -19,11 +19,13 @@ PIN_LOCK = "12345678"
 
 class RemoteControlApp:
     def __init__(self, root):
+        # Inisialisasi jendela utama aplikasi Tkinter
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1220x880")
         self.root.minsize(980, 680)
 
+        # Inisialisasi handler OS, variabel string reaktif, dan status awal
         self.os_handler = OSFeaturesHandler(self.run_adb)
         self.device = tk.StringVar()
         self.status = tk.StringVar(value="Sambungkan HP melalui USB, aktifkan USB Debugging, lalu Refresh.")
@@ -36,10 +38,12 @@ class RemoteControlApp:
         self.recording_process = None
         self.is_fetching_proc = False
 
+        # Variabel untuk penghitungan kecepatan jaringan
         self.prev_rx_bytes = 0
         self.prev_tx_bytes = 0
         self.prev_net_time = time.monotonic()
 
+        # Inisialisasi StringVar untuk monitor jaringan dan dashboard perangkat
         self.net_main_status = tk.StringVar(value="Memeriksa...")
         self.net_wifi_name = tk.StringVar(value="-")
         self.net_speed_dl = tk.StringVar(value="0 B/s")
@@ -74,6 +78,7 @@ class RemoteControlApp:
         self.dashboard_network_status = tk.StringVar(value="-")
         self.dashboard_storage = tk.StringVar(value="-")
 
+        # Membangun UI, memuat perangkat terhubung, dan menjalankan loop latar belakang
         self._build_ui()
         self.refresh_devices()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -81,17 +86,21 @@ class RemoteControlApp:
         self.auto_refresh_cpu_loop()
 
     def run_adb(self, device_id, *, args, timeout=15):
+        # Wrapper fungsi untuk menjalankan perintah ADB ke perangkat target
         return run_adb_cmd(device_id, args=args, timeout=timeout)
 
     def run_adb_local(self, args, timeout=15):
+        # Wrapper perintah ADB menggunakan ID perangkat yang sedang aktif dipilih di UI
         device_id = self.device.get().strip()
         return run_adb_cmd(device_id, args=args, timeout=timeout)
 
     def show_error(self, title, error):
+        # Menampilkan pesan error pada status bar dan pop-up dialog
         self.status.set(str(error))
         messagebox.showerror(title, str(error), parent=self.root)
         
     def extract_app_name(self, pkg_name):
+        # Kamus pemetaan nama package sistem/aplikasi populer agar mudah dibaca manusia
         known_apps = {
             "com.shopee.id": "Shopee",
             "com.google.android.apps.youtube.music": "YouTube Music",
@@ -142,24 +151,28 @@ class RemoteControlApp:
         return pkg_name.capitalize()
 
     def on_mem_tree_click(self, event):
+        # Event handler saat baris tabel manajemen memori diklik
         item = self.mem_tree.identify_row(event.y)
         if item:
             self.mem_tree.selection_set(item)
             self.load_memory_details_for_selected()
 
     def on_proc_tree_click(self, event):
+        # Event handler saat baris tabel proses CPU diklik
         item = self.proc_tree.identify_row(event.y)
         if item:
             self.proc_tree.selection_set(item)
             self.change_process_priority()
 
     def on_app_tree_click(self, event):
+        # Event handler saat baris tabel aplikasi diklik
         item = self.app_tree.identify_row(event.y)
         if item:
             self.app_tree.selection_set(item)
             self.force_stop_selected()
 
     def on_tab_changed(self, event):
+        # Memuat data secara dinamis saat pengguna berpindah antar tab menu
         try:
             selected_tab = self.notebook.tab(self.notebook.select(), "text")
             if selected_tab == "Manajemen Memori":
@@ -202,7 +215,6 @@ class RemoteControlApp:
                 err_msg = str(exc)
                 self.root.after(0, lambda msg=err_msg: self.status.set(f"Gagal memuat proses: {msg}"))
             finally:
-                # Pastikan flag selalu di-reset agar tombol bisa diklik lagi
                 self.is_fetching_proc = False
         else:
             self.is_fetching_proc = False
@@ -231,14 +243,11 @@ class RemoteControlApp:
                     pkg_name = clean_token
                     app_label = self.extract_app_name(pkg_name)
 
-            # Hitung nilai CPU float untuk pengurutan
             try:
                 cpu_float = float(str(cpu_pct).replace("%", "").strip())
             except ValueError:
                 cpu_float = 0.0
 
-            # Priority 0: Aplikasi Pengguna (terdeteksi package name)
-            # Priority 1: Layanan / Sistem Android
             is_app = (pkg_name != "-")
             priority = 0 if is_app else 1
 
@@ -250,7 +259,6 @@ class RemoteControlApp:
                 "cpu_float": cpu_float
             })
 
-        # Urutkan: Aplikasi Pengguna paling atas (priority 0), lalu diurutkan dari CPU terbesar
         processed_list.sort(key=lambda x: (x["priority"], -x["cpu_float"]))
 
         existing_items = {}
@@ -269,12 +277,10 @@ class RemoteControlApp:
                 item_id = existing_items[pid_str]
                 if self.proc_tree.item(item_id, "values") != vals:
                     self.proc_tree.item(item_id, values=vals)
-                # Pindahkan posisi baris agar sesuai urutan prioritas terbaru
                 self.proc_tree.move(item_id, "", idx)
             else:
                 self.proc_tree.insert("", idx, values=vals)
 
-        # Hapus proses yang sudah mati / tidak aktif
         for pid_str, item_id in existing_items.items():
             if pid_str not in new_pids:
                 self.proc_tree.delete(item_id)
@@ -292,12 +298,9 @@ class RemoteControlApp:
             wifi_dump = self.run_adb_local(["shell", "dumpsys", "wifi"], timeout=4)
             route_out = self.run_adb_local(["shell", "ip", "route"], timeout=3)
             
-            # 1. Cek rute interface wlan pada kernel Linux Android
             has_wlan_route = "wlan0" in route_out or "wlan1" in route_out
             
-            # 2. Ambil SSID HANYA jika HP bertindak sebagai Klien Wi-Fi (bukan SoftAP/Hotspot)
             for line in wifi_dump.splitlines():
-                # Filter khusus mWifiInfo (informasi koneksi Wi-Fi yang sedang tersambung)
                 if "mWifiInfo" in line and "SSID:" in line:
                     parts = line.split("SSID:")
                     if len(parts) > 1:
@@ -306,7 +309,6 @@ class RemoteControlApp:
                             wifi_ssid = candidate
                             break
 
-            # 3. Wi-Fi hanya dianggap aktif jika ada rute wlan0/wlan1 DAN tersambung ke router
             if has_wlan_route and wifi_ssid != "-":
                 wifi_active = True
             else:
@@ -317,7 +319,9 @@ class RemoteControlApp:
             data_active = True
 
         return wifi_active, wifi_ssid, data_active
+
     def load_network_traffic(self):
+        # Memuat statistik traffic jaringan, kecepatan transfer, kuota, dan ping
         try:
             device_id = self.device.get().strip()
             if not device_id:
@@ -397,21 +401,17 @@ class RemoteControlApp:
                 ping_latency = "RTO / Timeout"
             self.net_ping.set(ping_latency)
 
-            # Deteksi Hotspot & Sumber Jaringannya secara Akurat
             clients_list = []
             is_hotspot_on = False
             
             try:
-                # 1. Cek tabel rute IP (Hotspot Android selalu membuat subnet lokal seperti 192.168.43.x atau 192.168.50.x)
                 route_out = self.run_adb_local(["shell", "ip", "route"], timeout=3)
                 
-                # Hotspot dianggap AKTIF HANYA JIKA antarmuka ap/swlan/wlan1 dalam status UP dengan rute subnet aktif
                 for line in route_out.splitlines():
                     if any(iface in line for iface in ["ap0", "wlan1", "softap", "swlan0"]) and "dev" in line:
                         is_hotspot_on = True
                         break
 
-                # 2. Backup check via perintah connectivity tethering
                 if not is_hotspot_on:
                     tether_out = self.run_adb_local(["shell", "dumpsys", "connectivity"], timeout=3)
                     if "tetheringClasses" in tether_out or "tethered" in tether_out.lower():
@@ -427,7 +427,6 @@ class RemoteControlApp:
                     else:
                         self.net_hotspot_source.set("Paket Data Seluler — Meneruskan kuota seluler")
 
-                    # Baca daftar klien terhubung dari tabel ARP
                     arp_out = self.run_adb_local(["shell", "cat", "/proc/net/arp"], timeout=3)
                     for aline in arp_out.splitlines():
                         parts = aline.split()
@@ -457,6 +456,7 @@ class RemoteControlApp:
             pass
 
     def toggle_wifi_connection(self):
+        # Mengaktifkan atau menonaktifkan Wi-Fi di perangkat
         try:
             state = simpledialog.askstring("Kontrol Wi-Fi", "Ketik 'on' untuk menyalakan atau 'off' untuk mematikan Wi-Fi:", parent=self.root)
             if state:
@@ -473,6 +473,7 @@ class RemoteControlApp:
             self.show_error("Gagal", exc)
 
     def toggle_data_connection(self):
+        # Mengaktifkan atau menonaktifkan paket data seluler
         try:
             state = simpledialog.askstring("Kontrol Paket Data", "Ketik 'on' untuk menyalakan atau 'off' untuk mematikan Paket Data:", parent=self.root)
             if state:
@@ -489,6 +490,7 @@ class RemoteControlApp:
             self.show_error("Gagal", exc)
 
     def toggle_airplane_mode(self):
+        # Mengaktifkan atau menonaktifkan mode pesawat
         try:
             state = simpledialog.askstring("Mode Pesawat", "Ketik 'on' untuk mengaktifkan atau 'off' untuk menonaktifkan Mode Pesawat:", parent=self.root)
             if state:
@@ -517,7 +519,6 @@ class RemoteControlApp:
             success = False
 
             if val == 'on':
-                # 1. Coba aktifkan langsung di background (Android Stock/AOSP)
                 try:
                     out = self.run_adb_local(["shell", "cmd", "tethering", "startTethering", "0"], timeout=4)
                     if "Error" not in out and "Exception" not in out and "Permission" not in out:
@@ -525,7 +526,6 @@ class RemoteControlApp:
                 except Exception:
                     pass
 
-                # 2. Jika diblokir OS HP, buka langsung Halaman TetherSettings di HP
                 if not success:
                     try:
                         self.run_adb_local(["shell", "am", "start", "-a", "android.settings.TetherSettings"], timeout=4)
@@ -541,7 +541,6 @@ class RemoteControlApp:
                     messagebox.showinfo("Berhasil", "Perintah menyalakan Hotspot dikirim.", parent=self.root)
 
             elif val == 'off':
-                # Coba matikan di background
                 try:
                     out = self.run_adb_local(["shell", "cmd", "tethering", "stopTethering", "0"], timeout=4)
                     if "Error" not in out and "Exception" not in out:
@@ -579,13 +578,11 @@ class RemoteControlApp:
         self.status.set("Memuat daftar aplikasi untuk Manajemen Memori...")
         self.root.update()
 
-        # Jalankan query ADB di background thread agar UI tidak freeze
         threading.Thread(target=self._fetch_memory_packages_worker, args=(device_id,), daemon=True).start()
 
     def _fetch_memory_packages_worker(self, device_id):
         """Worker thread untuk mengambil daftar package pihak ketiga."""
         try:
-            # UBAH self.run_adb_cmd MENJADI self.run_adb
             output = self.run_adb(device_id, args=["shell", "pm", "list", "packages", "-3"], timeout=20)
             packages = []
             for line in output.splitlines():
@@ -602,7 +599,6 @@ class RemoteControlApp:
 
             app_list.sort(key=lambda x: x[0].lower())
 
-            # Kirim data kembali ke main thread
             self.root.after(0, self._populate_memory_tree_ui, app_list)
         except Exception as exc:
             err_msg = str(exc)
@@ -631,7 +627,6 @@ class RemoteControlApp:
         
         self.status.set(f"Mengambil data RAM & Storage untuk {app_name}...")
         
-        # Jalankan pemanggilan ADB di thread terpisah
         threading.Thread(target=self._fetch_memory_details_worker, args=(app_name, pkg_name), daemon=True).start()
 
     def _fetch_memory_details_worker(self, app_name, pkg_name):
@@ -735,12 +730,14 @@ class RemoteControlApp:
         except Exception as exc:
             err_msg = str(exc)
             self.root.after(0, self.show_error, "Gagal Memuat Detail Memori", err_msg)            
+
     def _render_memory_detail_text(self, detail_text, app_name):
         self.mem_detail_box.delete("1.0", tk.END)
         self.mem_detail_box.insert(tk.END, detail_text)
         self.status.set(f"Berhasil memuat analisis memori untuk {app_name}.")
         
     def load_uptime(self):
+        # Memuat informasi berapa lama perangkat telah menyala tanpa henti (uptime)
         try:
             device_id = self.device.get().strip()
             if not device_id:
@@ -784,6 +781,7 @@ class RemoteControlApp:
             threading.Thread(target=self._fetch_processes_worker, daemon=True).start()
             
     def change_process_priority(self):
+        # Mengubah prioritas proses (nilai nice) berdasarkan PID yang dipilih
         selected_item = self.proc_tree.selection()
         if not selected_item:
             messagebox.showinfo("Pilih Proses", "Pilih salah satu baris proses dari tabel terlebih dahulu.", parent=self.root)
@@ -802,6 +800,7 @@ class RemoteControlApp:
                 self.show_error("Gagal mengubah prioritas", exc)
 
     def refresh_devices(self):
+        # Mendeteksi perangkat ADB yang terhubung dan status otorisasi USB debugging
         try:
             devices, unauthorized = get_adb_devices()
             self.device_combo["values"] = devices
@@ -818,6 +817,7 @@ class RemoteControlApp:
             self.show_error("Gagal mendeteksi perangkat", exc)
 
     def refresh_dashboard(self):
+        # Memuat ringkasan sistem, hardware, baterai, dan suhu secara real-time
         if not self.device.get().strip():
             self.dashboard_connection.set("Tidak terhubung")
             self.dashboard_device_name.set("-")
@@ -978,10 +978,12 @@ class RemoteControlApp:
             self.status.set(str(exc))
 
     def refresh_dashboard_loop(self):
+        # Looping otomatis untuk memperbarui dashboard setiap 5 detik
         self.refresh_dashboard()
         self.root.after(5000, self.refresh_dashboard_loop)
 
     def device_info(self):
+        # Menampilkan pop-up informasi singkat perangkat
         try:
             model = self.run_adb_local(["shell", "getprop", "ro.product.model"])
             android = self.run_adb_local(["shell", "getprop", "ro.build.version.release"])
@@ -991,14 +993,17 @@ class RemoteControlApp:
             self.show_error("Gagal membaca perangkat", exc)
 
     def start_mirroring(self):
+        # Memulai screen mirroring menggunakan scrcpy
         self._start_scrcpy(screen_off=False)
 
     def start_mirroring_screen_off(self):
+        # Memulai screen mirroring dengan mematikan layar fisik HP
         if not messagebox.askyesno("Konfirmasi", "Coba matikan layar fisik HP saat mirroring berjalan?", parent=self.root):
             return
         self._start_scrcpy(screen_off=True)
 
     def start_recording(self):
+        # Memulai perekaman layar HP ke file video MP4
         if not self.device.get():
             messagebox.showwarning("Pilih perangkat", "Pilih HP yang terotorisasi terlebih dahulu.", parent=self.root)
             return
@@ -1017,6 +1022,7 @@ class RemoteControlApp:
             self.show_error("Gagal memulai rekaman layar", exc)
 
     def _start_scrcpy(self, screen_off):
+        # Fungsi internal untuk menjalankan proses scrcpy
         if not self.device.get():
             messagebox.showwarning("Pilih perangkat", "Pilih HP yang terotorisasi terlebih dahulu.", parent=self.root)
             return
@@ -1032,6 +1038,7 @@ class RemoteControlApp:
             self.show_error("Gagal memulai mirroring", exc)
 
     def lock_screen(self):
+        # Mengirim perintah untuk mengunci layar HP
         try:
             self.run_adb_local(["shell", "input", "keyevent", "26"])
             self.run_adb_local(["shell", "service", "call", "power", "16"])
@@ -1040,6 +1047,7 @@ class RemoteControlApp:
             self.show_error("Gagal mengunci layar", exc)
 
     def wake_screen(self):
+        # Mengirim perintah untuk membangunkan layar HP
         try:
             self.run_adb_local(["shell", "input", "keyevent", "224"])
             self.status.set("Perintah bangunkan layar dikirim.")
@@ -1047,6 +1055,7 @@ class RemoteControlApp:
             self.show_error("Gagal membangunkan layar", exc)
 
     def start_timer(self):
+        # Memulai timer pembatas sesi penggunaan HP
         try:
             minutes = int(self.minutes.get())
             if minutes < 1 or minutes > 1440:
@@ -1060,9 +1069,10 @@ class RemoteControlApp:
         self.timer_start = time.monotonic()
         self.timer_limit = minutes * 60
         self._tick_timer()
-        self.status.set(f"Timer sesi dimulai: {minutes} menit. HP akan dikunci total saat habis.")
+        self.status.set(f"Timer sesi dimulai: {minutes} menit. HP akan tidur.")
 
     def stop_timer(self):
+        # Menghentikan timer sesi
         self.timer_running = False
         self.session_locked = False
         if self.timer_job is not None:
@@ -1075,6 +1085,7 @@ class RemoteControlApp:
         self.status.set("Timer dihentikan. Sesi dibuka kembali.")
 
     def unlock_session(self):
+        # Membuka kunci layar HP otomatis dari laptop menggunakan PIN default
         self.session_locked = False
         try:
             self.wake_screen()
@@ -1089,6 +1100,7 @@ class RemoteControlApp:
             self.show_error("Gagal membuka kunci", exc)
 
     def _tick_timer(self):
+        # Fungsi perhitungan mundur waktu timer sesi
         if not self.timer_running or self.timer_start is None:
             return
         elapsed = int(time.monotonic() - self.timer_start)
@@ -1098,15 +1110,15 @@ class RemoteControlApp:
         if remaining <= 0:
             self.session_locked = True
             self.stop_timer()
-            self.timer_label.configure(text="TERKUNCI 🔒")
             self.lock_screen()
-            messagebox.showwarning("Batas Waktu Habis", "Batas waktu sesi habis!\nHP telah dikunci total. Masukkan PIN (12345678) lewat laptop untuk membuka kembali.", parent=self.root)
+            messagebox.showwarning("Batas Waktu Habis", "Batas waktu sesi habis!\nHP telah tidur.", parent=self.root)
             self._enforce_lock_loop()
             return
             
         self.timer_job = self.root.after(1000, self._tick_timer)
 
     def _enforce_lock_loop(self):
+        # Loop penguncian ketat jika sesi habis agar HP tidak bisa dibuka sembarangan
         if self.session_locked and self.device.get().strip():
             try:
                 power_state = self.run_adb_local(["shell", "dumpsys", "power"], timeout=5)
@@ -1129,6 +1141,7 @@ class RemoteControlApp:
             self.root.after(1000, self._enforce_lock_loop)
 
     def load_packages(self):
+        # Memuat daftar aplikasi pihak ketiga yang terinstal di HP
         try:
             self.status.set("Mengambil daftar aplikasi dan mengurutkan secara alfabetis...")
             self.root.update()
@@ -1178,6 +1191,7 @@ class RemoteControlApp:
             self.show_error("Gagal memuat aplikasi", exc)
 
     def force_stop_selected(self):
+        # Menghentikan paksa (force-stop) aplikasi yang dipilih dari tabel
         selected_items = self.app_tree.selection()
         if not selected_items:
             messagebox.showinfo("Pilih aplikasi", "Pilih salah satu atau beberapa aplikasi dari tabel terlebih dahulu.", parent=self.root)
@@ -1197,6 +1211,7 @@ class RemoteControlApp:
             self.show_error("Gagal force stop", exc)
 
     def push_file(self):
+        # Mengirim file dari laptop ke folder Download di HP
         path = filedialog.askopenfilename(parent=self.root, title="Pilih file untuk dikirim")
         if not path:
             return
@@ -1209,6 +1224,7 @@ class RemoteControlApp:
             self.show_error("Transfer gagal", exc)
 
     def install_apk(self):
+        # Memasang file APK dari laptop ke perangkat HP
         path = filedialog.askopenfilename(
             parent=self.root, title="Pilih file APK",
             filetypes=[("Android APK", "*.apk"), ("Semua file", "*.*")]
@@ -1228,6 +1244,7 @@ class RemoteControlApp:
             self.show_error("Instalasi gagal", exc)
 
     def _build_ui(self):
+        # Membangun seluruh tampilan antarmuka (GUI) aplikasi menggunakan Tkinter ttk
         self.root.configure(bg="#F3F6FC")
         style = ttk.Style()
         style.theme_use("clam")
@@ -1284,7 +1301,7 @@ class RemoteControlApp:
         self.notebook.add(process_tab, text="Manajemen Proses & CPU")
         self.notebook.add(files_tab, text="Transfer File")
 
-        # ==================== TAB MONITOR JARINGAN ====================
+        # Layout Tab Monitor Jaringan
         net_top = ttk.Frame(network_tab)
         net_top.pack(fill="x", pady=4)
         ttk.Button(net_top, text="🔄 Refresh Traffic", command=self.load_network_traffic).pack(side="left")
@@ -1294,7 +1311,6 @@ class RemoteControlApp:
         net_content_frame = ttk.Frame(network_tab)
         net_content_frame.pack(fill="both", expand=True, pady=6)
 
-        # Kartu 1: Status Jaringan Utama
         card_main = ttk.LabelFrame(net_content_frame, text="🔹 Status Koneksi Utama (Prioritas Wi-Fi Dulu)", padding=10)
         card_main.pack(fill="x", pady=4)
         
@@ -1308,7 +1324,6 @@ class RemoteControlApp:
             ttk.Label(row, text=lbl_txt, width=25).pack(side="left")
             ttk.Label(row, textvariable=var_ref, font=("TkDefaultFont", 10, "bold")).pack(side="left")
 
-        # Kartu 2: Kecepatan & Akumulasi Kuota
         card_stats = ttk.LabelFrame(net_content_frame, text="📊 Kecepatan & Statistik Kuota Terpakai", padding=10)
         card_stats.pack(fill="x", pady=4)
 
@@ -1324,7 +1339,6 @@ class RemoteControlApp:
             ttk.Label(row, text=lbl_txt, width=25).pack(side="left")
             ttk.Label(row, textvariable=var_ref, font=("TkDefaultFont", 10, "bold")).pack(side="left")
 
-        # Kartu 3: Status & Klien Hotspot
         card_hotspot = ttk.LabelFrame(net_content_frame, text="🌐 Status Hotspot & Perangkat Klien Terhubung", padding=10)
         card_hotspot.pack(fill="both", expand=True, pady=4)
 
@@ -1338,26 +1352,7 @@ class RemoteControlApp:
         ttk.Label(hs_src_row, text="Sumber Internet Hotspot:", width=25).pack(side="left")
         ttk.Label(hs_src_row, textvariable=self.net_hotspot_source, font=("TkDefaultFont", 10, "bold")).pack(side="left")
 
-        ttk.Label(card_hotspot, text="Daftar Perangkat Klien Terhubung:", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(8, 2))
-        
-        client_frame = ttk.Frame(card_hotspot)
-        client_frame.pack(fill="both", expand=True)
-        
-        self.client_tree = ttk.Treeview(client_frame, columns=("IP", "MAC", "Keterangan"), show="headings", height=4)
-        self.client_tree.heading("IP", text="IP Address")
-        self.client_tree.heading("MAC", text="MAC Address")
-        self.client_tree.heading("Keterangan", text="Status Klien")
-        self.client_tree.column("IP", width=150, anchor="center")
-        self.client_tree.column("MAC", width=200, anchor="center")
-        self.client_tree.column("Keterangan", width=350, anchor="w")
-        
-        client_scroll = ttk.Scrollbar(client_frame, orient="vertical", command=self.client_tree.yview)
-        self.client_tree.configure(yscrollcommand=client_scroll.set)
-        self.client_tree.pack(side="left", fill="both", expand=True)
-        client_scroll.pack(side="right", fill="y")
-        # ==============================================================================================
-
-        # Dashboard content
+        # Layout Dashboard Tab
         ttk.Label(dashboard_tab, text="Ringkasan Perangkat (Real-Time Dashboard)", font=("TkDefaultFont", 16, "bold")).pack(anchor="w", pady=(0, 12))
 
         info_frame = ttk.LabelFrame(dashboard_tab, text="Informasi Lengkap HP & Kesehatan Sistem", padding=12)
@@ -1395,7 +1390,7 @@ class RemoteControlApp:
         ttk.Button(dashboard_buttons, text="Perbarui informasi", command=self.refresh_dashboard).pack(side="left")
         ttk.Button(dashboard_buttons, text="Refresh perangkat", command=self.refresh_devices).pack(side="left", padx=8)
 
-        # Tab Mirroring, Rekam & Uptime
+        # Layout Tab Mirroring, Rekam & Uptime
         ttk.Label(mirror_usage_tab, text="Kontrol Layar & Perekaman (Scrcpy)", font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 4))
         
         control_row = ttk.Frame(mirror_usage_tab)
@@ -1406,7 +1401,7 @@ class RemoteControlApp:
         ttk.Button(control_row, text="Kunci Layar HP", command=self.lock_screen).pack(side="left", padx=6)
         ttk.Button(control_row, text="Bangunkan Layar", command=self.wake_screen).pack(side="left", padx=6)
 
-        timer_box = ttk.LabelFrame(mirror_usage_tab, text="Timer Batas Sesi & Penguncian PIN (12345678)", padding=8)
+        timer_box = ttk.LabelFrame(mirror_usage_tab, text="Timer Batas Sesi", padding=8)
         timer_box.pack(fill="x", pady=8)
         time_row = ttk.Frame(timer_box)
         time_row.pack(anchor="w", pady=2)
@@ -1414,7 +1409,6 @@ class RemoteControlApp:
         ttk.Entry(time_row, textvariable=self.minutes, width=8).pack(side="left", padx=8)
         ttk.Button(time_row, text="Mulai Timer", command=self.start_timer).pack(side="left", padx=4)
         ttk.Button(time_row, text="Hentikan Timer", command=self.stop_timer).pack(side="left", padx=4)
-        ttk.Button(time_row, text="🔓 Buka Kunci (PIN: 12345678)", command=self.unlock_session).pack(side="left", padx=12)
         
         self.timer_label = ttk.Label(timer_box, text="00:00", font=("TkDefaultFont", 14, "bold"))
         self.timer_label.pack(anchor="w", pady=4)
@@ -1434,7 +1428,7 @@ class RemoteControlApp:
         self.st_text.pack(side="left", fill="both", expand=True)
         st_scroll.config(command=self.st_text.yview)
 
-        # ==================== TAB MANAJEMEN MEMORI ====================
+        # Layout Tab Manajemen Memori
         mem_top = ttk.Frame(mem_tab)
         mem_top.pack(fill="x", pady=6)
         ttk.Button(mem_top, text="🔄 Refresh Daftar Aplikasi", command=self.load_memory_packages_list).pack(side="left")
@@ -1443,7 +1437,6 @@ class RemoteControlApp:
         mem_container = ttk.Frame(mem_tab)
         mem_container.pack(fill="both", expand=True, pady=4)
 
-        # Panel Kiri: Tabel Aplikasi (mem_tree)
         left_frame = ttk.LabelFrame(mem_container, text="Daftar Aplikasi Pihak Ketiga", padding=8)
         left_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
@@ -1464,7 +1457,6 @@ class RemoteControlApp:
         self.mem_tree.pack(side="left", fill="both", expand=True)
         mem_scroll.pack(side="right", fill="y")
 
-        # Panel Kanan: Detail Memori & Storage (mem_detail_box)
         right_frame = ttk.LabelFrame(mem_container, text="Detail Analisis Memori & Storage", padding=8)
         right_frame.pack(side="right", fill="both", expand=True, padx=(4, 0))
 
@@ -1478,7 +1470,7 @@ class RemoteControlApp:
         self.mem_detail_box.pack(side="left", fill="both", expand=True)
         detail_scroll.config(command=self.mem_detail_box.yview)
 
-        # ==================== TAB MANAJEMEN PROSES & CPU ====================
+        # Layout Tab Manajemen Proses & CPU
         proc_top = ttk.Frame(process_tab)
         proc_top.pack(fill="x", pady=6)
         ttk.Button(proc_top, text="🔄 Muat Ulang Real-Time", command=self.load_processes).pack(side="left")
@@ -1535,15 +1527,14 @@ class RemoteControlApp:
         self.proc_tree.grid(row=0, column=0, sticky="nsew")
         proc_v_scroll.grid(row=0, column=1, sticky="ns")
         proc_h_scroll.grid(row=1, column=0, sticky="ew")
-        # ==============================================================================================
 
-        # Tab Transfer File
+        # Layout Tab Transfer File
         ttk.Label(files_tab, text="Kirim file dari laptop ke folder Download HP.").pack(anchor="w")
         ttk.Button(files_tab, text="Pilih file lalu kirim ke HP", command=self.push_file).pack(anchor="w", pady=8)
         ttk.Label(files_tab, text="Pilih APK untuk memasangnya pada HP yang terhubung.").pack(anchor="w", pady=(16, 0))
         ttk.Button(files_tab, text="Pilih APK lalu instal", command=self.install_apk).pack(anchor="w", pady=8)
 
-        # Tab Aplikasi
+        # Layout Tab Aplikasi
         app_top = ttk.Frame(apps_tab)
         app_top.pack(fill="x", pady=6)
         ttk.Button(app_top, text="🔄 Refresh", command=self.load_packages).pack(side="left")
@@ -1576,11 +1567,13 @@ class RemoteControlApp:
         ttk.Label(footer, text="Status: ADB aktif (Real-Time Mode).").pack(anchor="w")
 
     def on_close(self):
+        # Menutup aplikasi secara aman dan menghentikan proses latar belakang
         self.stop_timer()
         self.root.destroy()
 
 
 def main():
+    # Fungsi utama untuk menjalankan aplikasi GUI Tkinter
     root = tk.Tk()
     RemoteControlApp(root)
     root.mainloop()

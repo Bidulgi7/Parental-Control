@@ -3,6 +3,7 @@
 
 class OSFeaturesHandler:
     def __init__(self, run_adb_func):
+        # Inisialisasi handler dengan fungsi eksekusi ADB yang diteruskan dari luar
         self.run_adb_func = run_adb_func
 
     def get_process_table(self, device_id):
@@ -10,14 +11,14 @@ class OSFeaturesHandler:
         processes = []
         
         try:
-            # Gunakan top -n 1 -b bawaan Android yang kompatibel di semua ROM
+            # Menjalankan perintah terminal 'top' bawaan Android untuk mengambil daftar proses aktif
             output_top = self.run_adb_func(
                 device_id, 
                 args=["shell", "top", "-n", "1", "-b"], 
                 timeout=4
             )
             
-            # Fallback jika flag -b tidak didukung oleh versi ROM tertentu
+            # Fallback (cadangan) jika flag -b tidak didukung oleh versi ROM HP tertentu
             if not output_top:
                 output_top = self.run_adb_func(
                     device_id, 
@@ -36,7 +37,7 @@ class OSFeaturesHandler:
                 if not line_str:
                     continue
                 
-                # Lewati baris ringkasan atas sampai menemukan baris header tabel
+                # Mendeteksi baris header tabel proses pada output perintah top
                 if "PID" in line_str and ("USER" in line_str or "ARGS" in line_str or "NAME" in line_str or "CPU" in line_str):
                     header_found = True
                     continue
@@ -48,7 +49,7 @@ class OSFeaturesHandler:
                 if len(tokens) >= 12:
                     pid, user, pr, ni, virt, res, shr, stat, cpu, mem, time_val, cmd = tokens
                 elif len(tokens) >= 9:
-                    # Format alternatif untuk beberapa versi ROM Android
+                    # Menangani format alternatif untuk beberapa versi ROM Android
                     pid, user = tokens[0], tokens[1]
                     cpu, mem = tokens[2], tokens[3]
                     cmd = tokens[-1]
@@ -56,9 +57,11 @@ class OSFeaturesHandler:
                 else:
                     continue
 
+                # Memastikan token PID benar-benar berupa angka
                 if not pid.isdigit():
                     continue
 
+                # Menerjemahkan kode status proses Linux menjadi label yang mudah dibaca
                 if stat.startswith("R"):
                     status_display = "Running (Aktif)"
                 elif stat.startswith("S") or stat.startswith("D"):
@@ -70,9 +73,11 @@ class OSFeaturesHandler:
                 else:
                     status_display = f"Status ({stat})"
 
+                # Memformat persentase penggunaan CPU dan Memori
                 cpu_pct = cpu if cpu.endswith("%") else cpu + "%"
                 mem_pct = mem if mem.endswith("%") else mem + "%"
 
+                # Menambahkan data proses yang sudah diparsing ke dalam list
                 processes.append((
                     pid, user, status_display, pr, ni, virt, res, shr, cpu_pct, mem_pct, time_val, cmd
                 ))
@@ -82,6 +87,7 @@ class OSFeaturesHandler:
         return processes
         
     def get_app_memory_usage(self, device_id, package_name):
+        # Mengambil informasi penggunaan memori mendalam (dumpsys meminfo) untuk package tertentu
         try:
             output = self.run_adb_func(device_id, args=["shell", "dumpsys", "meminfo", package_name], timeout=15)
             summary_lines = []
@@ -93,6 +99,7 @@ class OSFeaturesHandler:
             return f"Gagal memuat memori untuk {package_name}: {str(exc)}"
 
     def get_app_usage_stats(self, device_id):
+        # Mengambil statistik penggunaan baterai dan durasi aktivitas aplikasi (batterystats)
         try:
             output = self.run_adb_func(device_id, args=["shell", "dumpsys", "batterystats"], timeout=15)
             app_times = []
